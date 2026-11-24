@@ -36,9 +36,9 @@ class _TeeStream(io.TextIOBase):
         self._log = log_file
 
     def write(self, data: str) -> int:
-        # Drop intermediate tqdm redraw frames (contain bar char '━' but not '100%')
-        # so Colab's browser DOM never lags from megabytes of redraw spam.
-        if "━" in data and "100%" not in data:
+        # Drop intermediate tqdm redraw frames (0%-99% contain '━' or '─' without '100%')
+        # so Colab's browser DOM stays ultra-light across long multi-run overnight queues.
+        if ("━" in data or "─" in data) and "100%" not in data:
             return len(data)
         n = self._orig.write(data)
         self._orig.flush()
