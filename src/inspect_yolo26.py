@@ -78,7 +78,7 @@ def run_audit(out_md: Optional[Path] = None, test_p2_load: bool = True) -> str:
     try:
         model = YOLO("yolo26n.pt")
         detect_head = model.model.model[-1]
-        n_layers, n_params, n_grads, gflops = model.info(verbose=False)
+        n_layers, n_params, n_grads, gflops = model.model.info(verbose=False)
         sections.append(f"- `model.info()`: layers={n_layers}, params={n_params:,}, gflops={gflops:.3f}")
         sections.append(f"- Detect head class: `{type(detect_head).__name__}`")
         for attr in ("end2end", "reg_max", "nc", "nl", "stride", "max_det", "legacy"):
@@ -99,7 +99,7 @@ def run_audit(out_md: Optional[Path] = None, test_p2_load: bool = True) -> str:
         try:
             p2_model = YOLO("yolo26n-p2.yaml").load("yolo26n.pt")
             p2_head = p2_model.model.model[-1]
-            n_layers, n_params, _, gflops = p2_model.info(verbose=False)
+            n_layers, n_params, _, gflops = p2_model.model.info(verbose=False)
             sections.append(f"- `yolo26n-p2` info: layers={n_layers}, params={n_params:,}, gflops={gflops:.3f}")
             sections.append(f"- `p2_head.stride` = `{getattr(p2_head, 'stride', None)}`")
             sections.append(f"- `p2_head.reg_max` = `{getattr(p2_head, 'reg_max', None)}`")

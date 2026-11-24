@@ -21,7 +21,6 @@ from typing import Optional
 
 from configs.experiments import ExperimentConfig, get_experiment_config, list_presets
 from src.eval_utils import evaluate_checkpoint, save_qualitative_predictions
-from src.modules import build_model_with_switches
 
 
 def _sync_tree(src: Path, dst: Path) -> None:
@@ -104,10 +103,14 @@ def run_experiment(
                 print(f"[RESUME] Resuming interrupted run from: {resume_ckpt}")
                 break
 
+    from src.modules import attach_phase1_callbacks, build_model_with_switches
+
     if resume_ckpt is not None:
         from ultralytics import YOLO
 
         model = YOLO(str(resume_ckpt))
+        # Re-attach training-only hooks (e.g. Mod C1/C2 NWD criterion patch) on resume!
+        attach_phase1_callbacks(model, cfg)
     else:
         model = build_model_with_switches(cfg, repo_root=repo_root)
 
