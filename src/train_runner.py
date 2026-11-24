@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
 import shutil
 import sys
 import time
@@ -24,19 +25,25 @@ from typing import Optional
 from configs.experiments import ExperimentConfig, get_experiment_config, list_presets
 from src.eval_utils import evaluate_checkpoint, save_qualitative_predictions
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
 
 class _TeeStream(io.TextIOBase):
-    """Mirror stdout/stderr to both console and a fast local log file."""
+    """Mirror stdout/stderr to console and log file while filtering noisy tqdm redraws."""
 
     def __init__(self, orig_stream, log_file):
         self._orig = orig_stream
         self._log = log_file
 
     def write(self, data: str) -> int:
+        # Drop intermediate tqdm redraw frames (contain bar char '━' but not '100%')
+        # so Colab's browser DOM never lags from megabytes of redraw spam.
+        if "━" in data and "100%" not in data:
+            return len(data)
         n = self._orig.write(data)
         self._orig.flush()
-        # Keep log clean and readable even with tqdm carriage returns
-        self._log.write(data.replace("\r", "\n"))
+        clean = _ANSI_RE.sub("", data).replace("\r", "\n")
+        self._log.write(clean)
         self._log.flush()
         return n
 
