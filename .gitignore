@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# OS & Editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# ML Artifacts (keep large files in Google Drive, never commit to GitHub)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.zip
+*.tar
+*.gz
+runs/
+weights/
+datasets/
+outputs/
+logs/
+*.csv
+!configs/*.csv
+
+# Secrets / Environment
+.env
+.env.local
+*token*
+*secret*
