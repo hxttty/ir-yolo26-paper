@@ -217,9 +217,7 @@ def attach_nwd_e2e_hook(
         return
 
     def _on_train_start(trainer: Any) -> None:
-        from ultralytics.utils.torch_utils import de_parallel
-
-        raw_model = de_parallel(trainer.model)
+        raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
         orig_init = raw_model.init_criterion
 
         def _wrapped_init_criterion() -> Any:
