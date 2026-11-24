@@ -300,8 +300,29 @@ def _parse_presplit_yolo_dir(
     return parsed
 
 
+def _link_or_copy_tree(src_dir: Path, dst_dir: Path) -> None:
+    """Populate real directories with zero-space hardlinks (fallback to copy2).
+
+    Why not directory symlinks? Ultralytics calls `.resolve()` on image paths
+    before mapping `/images/` -> `/labels/`, which follows directory symlinks
+    back into `hit_uav_bundle/images` where `labels/` does not exist.
+    Hardlinks keep `.resolve()` strictly inside `hit_uav_4cls/` or `hit_uav_5cls/`
+    while using 0 extra disk bytes.
+    """
+    for src_file in src_dir.rglob("*"):
+        if not src_file.is_file():
+            continue
+        rel = src_file.relative_to(src_dir)
+        dst_file = dst_dir / rel
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src_file, dst_file)
+        except OSError:
+            shutil.copy2(src_file, dst_file)
+
+
 def _build_yaml_and_symlinks(bundle_dir: Path, out_root: Path) -> Tuple[Path, Path]:
-    """Create lightweight sibling symlink views (`hit_uav_4cls`, `hit_uav_5cls`) + YAMLs."""
+    """Create real `hit_uav_4cls` & `hit_uav_5cls` dataset views (hardlinked) + YAMLs."""
     yaml_paths = {}
     configs = [
         ("4cls", "labels_4cls", CLASS_NAMES_4),
@@ -311,9 +332,10 @@ def _build_yaml_and_symlinks(bundle_dir: Path, out_root: Path) -> Tuple[Path, Pa
         view_dir = out_root / f"hit_uav_{tag}"
         if view_dir.exists() or view_dir.is_symlink():
             shutil.rmtree(view_dir)
-        view_dir.mkdir(parents=True, exist_ok=True)
-        os.symlink((bundle_dir / "images").resolve(), view_dir / "images", target_is_directory=True)
-        os.symlink((bundle_dir / lbl_folder).resolve(), view_dir / "labels", target_is_directory=True)
+        (view_dir / "images").mkdir(parents=True, exist_ok=True)
+        (view_dir / "labels").mkdir(parents=True, exist_ok=True)
+        _link_or_copy_tree(bundle_dir / "images", view_dir / "images")
+        _link_or_copy_tree(bundle_dir / lbl_folder, view_dir / "labels")
 
         yaml_obj = {
             "path": str(view_dir.resolve()),
