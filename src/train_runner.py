@@ -12,15 +12,43 @@ Features built for iterative research ("改了跑、跑了改") without wasting 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
 from configs.experiments import ExperimentConfig, get_experiment_config, list_presets
 from src.eval_utils import evaluate_checkpoint, save_qualitative_predictions
+
+
+class _TeeStream(io.TextIOBase):
+    """Mirror stdout/stderr to both console and a fast local log file."""
+
+    def __init__(self, orig_stream, log_file):
+        self._orig = orig_stream
+        self._log = log_file
+
+    def write(self, data: str) -> int:
+        n = self._orig.write(data)
+        self._orig.flush()
+        # Keep log clean and readable even with tqdm carriage returns
+        self._log.write(data.replace("\r", "\n"))
+        self._log.flush()
+        return n
+
+    def flush(self) -> None:
+        self._orig.flush()
+        self._log.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._orig, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._orig.fileno()
 
 
 def _sync_tree(src: Path, dst: Path) -> None:
@@ -247,13 +275,37 @@ def main() -> None:
     )
 
     repo_root = Path(__file__).resolve().parent.parent
-    run_experiment(
-        cfg,
-        dataset_root=args.dataset_root,
-        local_work_dir=args.work_dir,
-        drive_dir=args.drive_dir,
-        repo_root=repo_root,
-    )
+    local_log_dir = args.work_dir / "logs"
+    local_log_dir.mkdir(parents=True, exist_ok=True)
+    local_log_path = local_log_dir / f"{cfg.exp_name}.log"
+
+    orig_out, orig_err = sys.stdout, sys.stderr
+    with local_log_path.open("w", encoding="utf-8") as log_f:
+        sys.stdout = _TeeStream(orig_out, log_f)
+        sys.stderr = _TeeStream(orig_err, log_f)
+        try:
+            run_experiment(
+                cfg,
+                dataset_root=args.dataset_root,
+                local_work_dir=args.work_dir,
+                drive_dir=args.drive_dir,
+                repo_root=repo_root,
+            )
+        except Exception:
+            traceback.print_exc()
+            raise
+        finally:
+            sys.stdout = orig_out
+            sys.stderr = orig_err
+            if args.drive_dir is not None:
+                try:
+                    drive_logs = args.drive_dir / "logs"
+                    drive_logs.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(local_log_path, drive_logs / f"{cfg.exp_name}.log")
+                    shutil.copy2(local_log_path, drive_logs / "latest_run.log")
+                    print(f"[LOG SYNC] Full log synced to Drive: {drive_logs / 'latest_run.log'}")
+                except Exception as exc:
+                    print(f"[WARN] Could not sync run log to Drive: {exc}")
 
 
 if __name__ == "__main__":
