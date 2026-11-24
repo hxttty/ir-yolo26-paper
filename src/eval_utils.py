@@ -170,18 +170,18 @@ def evaluate_checkpoint(
 ) -> Dict[str, Any]:
     """Run complete Val + Test (+ O2O/O2M Δ_E2E + optional 640x512 & ONNX) evaluation."""
     from ultralytics import YOLO
+    from ultralytics.utils.torch_utils import get_flops, get_num_params
     from src.modules import extract_tcad_gate_stats  # Also ensures TCADWrapper is importable for unpickling
 
     model = YOLO(str(weights_path))
-    info_ret = model.model.info(verbose=False)
-    if info_ret is not None and len(info_ret) == 4:
-        n_layers, n_params, _, gflops = info_ret
-    else:
-        n_layers = len(list(model.model.modules()))
-        n_params = sum(p.numel() for p in model.model.parameters())
+    n_layers = len(list(model.model.modules()))
+    n_params = int(get_num_params(model.model))
+    try:
+        gflops = float(get_flops(model.model, imgsz=imgsz))
+    except Exception:
         gflops = 0.0
     params_m = round(n_params / 1e6, 4)
-    gflops_r = round(float(gflops), 3)
+    gflops_r = round(gflops, 3)
 
     summary: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
