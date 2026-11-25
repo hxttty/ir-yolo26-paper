@@ -1,10 +1,13 @@
-"""Custom model/loss/assigner modules for Phase 1 ablations (Mod A, B, C1, C2)."""
+"""Custom model/loss/assigner modules for Phase 1 & V2 ablations."""
 
 from .hooks import attach_phase1_callbacks, build_model_with_switches
-from .tcad import TCADWrapper, extract_tcad_gate_stats
+from .tc_gate import TCGateWrapper
+from .tcad import BiTCStemWrapper, TCADWrapper, extract_tcad_gate_stats
 
 __all__ = [
+    "BiTCStemWrapper",
     "TCADWrapper",
+    "TCGateWrapper",
     "attach_phase1_callbacks",
     "build_model_with_switches",
     "extract_tcad_gate_stats",

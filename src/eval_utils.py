@@ -169,15 +169,16 @@ def evaluate_checkpoint(
     master_csv_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run complete Val + Test (+ O2O/O2M Δ_E2E + optional 640x512 & ONNX) evaluation."""
+    import copy
     from ultralytics import YOLO
     from ultralytics.utils.torch_utils import get_flops, get_num_params
-    from src.modules import extract_tcad_gate_stats  # Also ensures TCADWrapper is importable for unpickling
+    from src.modules import extract_tcad_gate_stats  # Also ensures custom wrappers are importable for unpickling
 
     model = YOLO(str(weights_path))
     n_layers = len(list(model.model.modules()))
     n_params = int(get_num_params(model.model))
     try:
-        gflops = float(get_flops(model.model, imgsz=imgsz))
+        gflops = float(get_flops(copy.deepcopy(model.model).float().cpu(), imgsz=imgsz))
     except Exception:
         gflops = 0.0
     params_m = round(n_params / 1e6, 4)

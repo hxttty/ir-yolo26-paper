@@ -57,20 +57,24 @@ class ExperimentConfig:
     resume: bool = True                    # Auto-resume from Drive checkpoint if interrupted
     save_period: int = 25                  # Sync periodic checkpoints to Drive every N epochs
 
-    # --- Phase 1 Core Innovation Switches (A / B / C1 / C2) ---
-    use_mod_a: bool = False                # Mod A: Prune P5 PAN+Head -> Lightweight DWConv P2-P4 Head
-    mod_a_p2_channels: int = 32            # Compressed P2 channel width to control FLOPs/latency
-    mod_a_keep_p4_psa: bool = False        # Optional: retain lightweight PSA block on P4 output
+    # --- Phase 1 Core Innovation Switches (v1 legacy + v2 recommended) ---
+    use_mod_a: bool = False                  # Mod A v1: Prune P5 PAN+Head -> P2-P4 YAML (negative control)
+    mod_a_p2_channels: int = 32
+    mod_a_keep_p4_psa: bool = False
 
-    use_mod_b: bool = False                # Mod B: Zero-Init Gated Residual Bidirectional TCAD
-    mod_b_stages: tuple[int, ...] = (0, 1) # Shallow downsampling stages to wrap with TCAD
+    use_tc_gate: bool = False                # Mod A v2 (TC-Gate): Zero-Init Thermal Clutter Gate on Neck P3/P4
+    tc_gate_indices: tuple[int, ...] = (16, 19)
 
-    use_mod_c1: bool = False               # Mod C1: Scale-Gated NWD inside TaskAlignedAssigner (O2M + O2O conflict)
-    use_mod_c2: bool = False               # Mod C2: Scale-Gated NWD inside BboxLoss (split from C1 to test B+C2 conflict)
-    nwd_area_thresh: float = 1024.0        # Area threshold A_0 (px^2, COCO small = 32x32 = 1024)
-    nwd_tau: float = 256.0                 # Smooth sigmoid temperature for area gating
-    nwd_w_max: float = 0.4                 # Maximum NWD weight ω_max for tiny targets
-    nwd_constant_c: float = 12.8           # NWD normalization constant C
+    use_mod_b: bool = False                  # Mod B: Zero-Init Gated Residual Thermal Contrast Downsampling
+    mod_b_variant: str = "v2"                # "v2" (BiTC-Stem |Avg3-Avg5| on Stage 1) or "v1" (legacy Stage 0+1)
+    mod_b_stages: tuple[int, ...] = (1,)     # Default Stage 1 only for v2 (preserves crisp Stage 0 & low latency)
+
+    use_mod_c1: bool = False                 # Mod C1 v2 (DSG-Assign): FP32 Decoupled Scale-Gated NWD in Assigner
+    use_mod_c2: bool = False                 # Mod C2 v2 (DSG-Loss): FP32 Scale-Gated NWD in DFL-Free BboxLoss
+    nwd_area_thresh: float = 1024.0          # Area threshold A_0 (px^2, COCO small = 32x32 = 1024)
+    nwd_tau: float = 256.0                   # Smooth sigmoid temperature for area gating
+    nwd_w_max: float = 0.25                  # Calibrated NWD weight ceiling for tiny IR targets
+    nwd_constant_c: float = 8.0              # Tighter NWD constant matched to 8x10 px IR pedestrians
 
     # --- Extra Ultralytics train kwargs ---
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
@@ -98,10 +102,21 @@ PRESETS: Dict[str, ExperimentConfig] = {
     "p0_yolo26n_musgd": ExperimentConfig(
         exp_name="p0_yolo26n_musgd",
         phase="phase0",
-        notes="YOLO26n official baseline with default optimizer (MuSGD) on HIT-UAV 4cls",
+        notes="YOLO26n official baseline with optimizer=auto (selects AdamW lr=0.00125 on HIT-UAV 4cls)",
         model_cfg="yolo26n.pt",
         is_e2e_model=True,
         optimizer="auto",
+        epochs=200,
+        batch=32,
+    ),
+    "p0_yolo26n_true_musgd": ExperimentConfig(
+        exp_name="p0_yolo26n_true_musgd",
+        phase="phase0",
+        notes="YOLO26n explicit optimizer=MuSGD check vs auto(AdamW) and SGD on HIT-UAV 4cls",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="MuSGD",
+        lr0=0.01,
         epochs=200,
         batch=32,
     ),
@@ -211,10 +226,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
     "p1_mod_b": ExperimentConfig(
         exp_name="p1_mod_b",
         phase="phase1",
-        notes="Ablation +B: Zero-init gated residual bidirectional TCAD on P3-P5 baseline",
+        notes="Ablation +B (v1 legacy): Zero-init Max/Min/Avg TCAD on Stages (0,1)",
         model_cfg="yolo26n.pt",
         is_e2e_model=True,
         use_mod_b=True,
+        mod_b_variant="v1",
+        mod_b_stages=(0, 1),
         epochs=200,
         batch=32,
     ),
@@ -292,6 +309,109 @@ PRESETS: Dict[str, ExperimentConfig] = {
         epochs=200,
         batch=24,
     ),
+
+    # =========================================================================
+    # Phase 1 V2: Pretrained-Preserving (708/708) + FP32 Decoupled DSG-NWD Suite
+    # =========================================================================
+    "p1v2_bitc": ExperimentConfig(
+        exp_name="p1v2_bitc",
+        phase="p1v2",
+        notes="V2 +BiTC-Stem: Band-pass |Avg3-Avg5| on Stage 1 only (~576 params, <0.15ms, 708/708 pretrained)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_b=True,
+        mod_b_variant="v2",
+        mod_b_stages=(1,),
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_tcgate": ExperimentConfig(
+        exp_name="p1v2_tcgate",
+        phase="p1v2",
+        notes="V2 +TC-Gate: Zero-init local-contrast spatial clutter gate on Neck P3/P4 (~230 params, <0.12ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_tc_gate=True,
+        tc_gate_indices=(16, 19),
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_c1": ExperimentConfig(
+        exp_name="p1v2_c1",
+        phase="p1v2",
+        notes="V2 +DSG-Assign (C1): FP32 Decoupled Scale-Gated NWD in Assigner only (IoU-calibrated target_scores, 0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_c1=True,
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_c2": ExperimentConfig(
+        exp_name="p1v2_c2",
+        phase="p1v2",
+        notes="V2 +DSG-Loss (C2): FP32 Scale-Gated NWD in DFL-Free BboxLoss only (0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_c2=True,
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_c12": ExperimentConfig(
+        exp_name="p1v2_c12",
+        phase="p1v2",
+        notes="V2 +DSG-NWD (C1+C2): FP32 Decoupled Assigner + Scale-Gated BboxLoss (0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_c1=True,
+        use_mod_c2=True,
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_bitc_tcgate": ExperimentConfig(
+        exp_name="p1v2_bitc_tcgate",
+        phase="p1v2",
+        notes="V2 +BiTC-Stem +TC-Gate: Front-end + Neck thermal clutter synergy (708/708 pretrained)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_b=True,
+        mod_b_variant="v2",
+        mod_b_stages=(1,),
+        use_tc_gate=True,
+        tc_gate_indices=(16, 19),
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_full_c1": ExperimentConfig(
+        exp_name="p1v2_full_c1",
+        phase="p1v2",
+        notes="V2 Full Candidate 1: BiTC-Stem + TC-Gate + DSG-Assign (C1 only, zero regression conflict)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_b=True,
+        mod_b_variant="v2",
+        mod_b_stages=(1,),
+        use_tc_gate=True,
+        tc_gate_indices=(16, 19),
+        use_mod_c1=True,
+        epochs=200,
+        batch=32,
+    ),
+    "p1v2_full_c12": ExperimentConfig(
+        exp_name="p1v2_full_c12",
+        phase="p1v2",
+        notes="V2 Full Candidate 2: BiTC-Stem + TC-Gate + DSG-NWD (C1+C2 all 3 pillars)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        use_mod_b=True,
+        mod_b_variant="v2",
+        mod_b_stages=(1,),
+        use_tc_gate=True,
+        tc_gate_indices=(16, 19),
+        use_mod_c1=True,
+        use_mod_c2=True,
+        epochs=200,
+        batch=32,
+    ),
 }
 
 
@@ -343,9 +463,11 @@ def list_presets() -> str:
     for name, cfg in PRESETS.items():
         flags = []
         if cfg.use_mod_a:
-            flags.append("A")
+            flags.append("A_v1")
+        if cfg.use_tc_gate:
+            flags.append("TCGate")
         if cfg.use_mod_b:
-            flags.append("B")
+            flags.append(f"B_{cfg.mod_b_variant}")
         if cfg.use_mod_c1:
             flags.append("C1")
         if cfg.use_mod_c2:

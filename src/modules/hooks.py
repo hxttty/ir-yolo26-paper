@@ -1,13 +1,14 @@
-"""Model builder and Phase 1 switch dispatcher (Mod A, B, C1, C2).
+"""Model builder and Phase 1 / V2 switch dispatcher.
 
-All patches are verified against installed `ultralytics 8.4.218`:
-- Mod A (`use_mod_a`): Uses `configs/models/yolo26n_p2p4.yaml` (pruned P5 PAN + Head,
-  compressed 32ch P2 + DWConv) + partial weight transfer from `yolo26n.pt`.
-- Mod B (`use_mod_b`): Wraps `trainer.setup_model` inside `on_pretrain_routine_start`
-  so `TCADWrapper` is injected IMMEDIATELY after the final `nc`-matched model + COCO
-  pretrained weights are built, and BEFORE `.to(device)`, `ModelEMA`, and `build_optimizer()`.
-- Mod C1/C2 (`use_mod_c1`, `use_mod_c2`): Hooks `on_train_start` to patch both `one2many`
-  and `one2one` branches of `E2ELoss` with Scale-Gated NWD (training-only, zero inference cost).
+All patches verified against installed `ultralytics 8.4.218`:
+- Mod A v1 (`use_mod_a`): Pruned P5 PAN+Head + P2-P4 YAML (kept as negative empirical control).
+- Mod A v2 (`use_tc_gate`): Zero-Init Thermal Clutter Suppression Gate (`TC-Gate`) wrapped on
+  pretrained neck P3/P4 (#16, #19) AFTER `setup_model()` -> preserves 708/708 pretrained weights!
+- Mod B (`use_mod_b`):
+    - `mod_b_variant="v2"` (`BiTC-Stem`, recommended): Band-pass `|Avg3 - Avg5|` on Stage 1 only.
+    - `mod_b_variant="v1"` (legacy): Max/Min/Avg TCAD on Stages (0, 1).
+- Mod C1/C2 (`use_mod_c1`, `use_mod_c2`): FP32 Decoupled Scale-Gated NWD (`DSG-NWD`) hooked
+  into `E2ELoss` (`one2many` + `one2one`) during training only (zero inference overhead).
 """
 
 from __future__ import annotations
@@ -17,24 +18,39 @@ from typing import Any
 
 from configs.experiments import ExperimentConfig
 from src.modules.nwd_e2e import attach_nwd_e2e_hook
+from src.modules.tc_gate import inject_tc_gate_into_model
 from src.modules.tcad import inject_tcad_into_model
 
 
 def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
-    """Attach Mod B and Mod C1/C2 callbacks onto an Ultralytics YOLO instance (fresh or resumed)."""
-    if cfg.use_mod_b:
+    """Attach structural (BiTC-Stem / TC-Gate) and supervision (DSG-NWD) hooks."""
+    if cfg.use_mod_b or cfg.use_tc_gate:
         def _on_pretrain_routine_start(trainer: Any) -> None:
             orig_setup_model = trainer.setup_model
 
             def _wrapped_setup_model() -> Any:
                 ckpt = orig_setup_model()
-                inject_tcad_into_model(trainer.model, stages=cfg.mod_b_stages)
+                if cfg.use_mod_b:
+                    inject_tcad_into_model(
+                        trainer.model,
+                        stages=cfg.mod_b_stages,
+                        variant=cfg.mod_b_variant,
+                    )
+                if cfg.use_tc_gate:
+                    inject_tc_gate_into_model(
+                        trainer.model,
+                        neck_indices=cfg.tc_gate_indices,
+                    )
                 return ckpt
 
             trainer.setup_model = _wrapped_setup_model
 
         model.add_callback("on_pretrain_routine_start", _on_pretrain_routine_start)
-        print(f"[MOD B] Registered setup_model wrapper for stages {cfg.mod_b_stages}.")
+        print(
+            f"[STRUCT HOOK] Registered setup_model wrapper: "
+            f"BiTC({cfg.mod_b_variant})={cfg.use_mod_b}@{cfg.mod_b_stages}, "
+            f"TC-Gate={cfg.use_tc_gate}@{cfg.tc_gate_indices}"
+        )
 
     if cfg.use_mod_c1 or cfg.use_mod_c2:
         attach_nwd_e2e_hook(
@@ -49,7 +65,7 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
 
 
 def build_model_with_switches(cfg: ExperimentConfig, repo_root: Path) -> Any:
-    """Instantiate Ultralytics model and register enabled Phase 1 switches."""
+    """Instantiate Ultralytics model and register enabled switches."""
     from ultralytics import YOLO
 
     model_spec = cfg.model_cfg
@@ -59,7 +75,9 @@ def build_model_with_switches(cfg: ExperimentConfig, repo_root: Path) -> Any:
 
     print(
         f"[MODEL] Loading {model_spec} | "
-        f"ModA={cfg.use_mod_a} ModB={cfg.use_mod_b} ModC1={cfg.use_mod_c1} ModC2={cfg.use_mod_c2}"
+        f"ModA_v1={cfg.use_mod_a} TC-Gate={cfg.use_tc_gate} "
+        f"ModB({cfg.mod_b_variant})={cfg.use_mod_b} "
+        f"C1={cfg.use_mod_c1} C2={cfg.use_mod_c2}"
     )
     model = YOLO(model_spec)
 
