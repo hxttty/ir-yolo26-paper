@@ -124,7 +124,9 @@ def _patch_assigner_c1_decoupled(
             u_match = ((1.0 - omega) * ciou + omega * nwd).clamp_(0.0, 1.0)
             align_values = bbox_scores.float().pow(self.alpha) * u_match.pow(self.beta)
 
-        out_dtype = pd_scores.dtype
+        # CRITICAL: Keep overlaps & align_metric in float32 (matching gt_bboxes.dtype in tal.py)!
+        # Casting to float16 makes self.eps=1e-9 round to 0.0, causing 0/0=NaN in norm_align_metric.
+        out_dtype = gt_bboxes.dtype if gt_bboxes.dtype == torch.float32 else torch.float32
         overlap_values = ciou.to(out_dtype)
         align_values = align_values.to(out_dtype)
 
