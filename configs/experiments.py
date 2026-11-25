@@ -42,10 +42,17 @@ class ExperimentConfig:
     warmup_epochs: float = 3.0
     close_mosaic: int = 10
     workers: int = 4
-    cache: bool = True                     # Cache 2,029 640x512 IR images in Colab L4 53GB RAM (huge speedup)
+    cache: bool | str = True               # True ("ram"), "disk" (100% deterministic), or False
     amp: bool = True
     seed: int = 42
     deterministic: bool = True
+
+    # --- Optional IR-Clean Augmentation & Val Alignment Overrides (None = Ultralytics default) ---
+    hsv_h: Optional[float] = None          # IR-Clean: 0.0 (LWIR is single-band thermal, no hue)
+    hsv_s: Optional[float] = None          # IR-Clean: 0.0 (no saturation)
+    hsv_v: Optional[float] = None          # IR-Clean: 0.25 (models thermal gain / contrast drift)
+    erasing: Optional[float] = None        # IR-Clean: 0.0 (prevents erasing 8x10px IR pedestrians)
+    align_val_rect_false: bool = False     # True: align in-training val (`best.pt`) to 640x640 square
 
     # --- Evaluation & Benchmark Switches ---
     eval_rect_640x512: bool = True         # Also benchmark native 640x512 rectangular inference
@@ -75,6 +82,39 @@ class ExperimentConfig:
     nwd_tau: float = 256.0                   # Smooth sigmoid temperature for area gating
     nwd_w_max: float = 0.25                  # Calibrated NWD weight ceiling for tiny IR targets
     nwd_constant_c: float = 8.0              # Tighter NWD constant matched to 8x10 px IR pedestrians
+
+    # --- Phase 1 V3 Innovation Switches (Orthogonal, Border-Safe, Sacred-O2M ODCS) ---
+    use_v3_odcs: bool = False                # Pillar 1 master switch (zero inference overhead)
+    v3_prog_floor: bool = False              # Pillar 1a: Protected-Floor ProgLoss (o2m >= 0.45, o2o ramp 60%)
+    v3_o2m_floor: float = 0.45
+    v3_o2o_ramp_frac: float = 0.60
+    v3_o2m_kd: bool = False                  # Pillar 1b: Selective O2M -> O2O Self-Distillation
+    v3_kd_weight: float = 0.30
+    v3_kd_sup_weight: float = 0.10
+    v3_kd_warmup_epochs: int = 10
+    v3_kd_topk_runners: int = 7
+    v3_o2o_annealed_assign: bool = False     # Pillar 1c: O2O-only annealed NWD assign (A0=256) + dead-anchor floor
+    v3_nwd_area_thresh: float = 256.0
+    v3_nwd_tau: float = 64.0
+    v3_nwd_w_max: float = 0.25
+    v3_nwd_c: float = 8.0
+    v3_anneal_frac: float = 0.60
+    v3_reg_floor_eps: float = 0.25
+    v3_reg_loss_type: str = "ciou"           # "ciou", "piou2" (Neural Networks 2024), or "sdloss" (AAAI 2025)
+    v3_piou_lambda: float = 1.3
+    v3_sd_delta: float = 0.5
+    v3_sd_b_max: float = 256.0
+    v3_reg_both_heads: bool = False          # False = sacred O2M teacher; True = also apply PIoU2/SDLoss to O2M
+
+    use_v3_bitc: bool = False                # Pillar 2: Border-Safe BiTC-Stem (replicate pad + Charbonnier, +608 params)
+    v3_bitc_stages: tuple[int, ...] = (1,)
+
+    use_v3_neck: bool = False                # Pillar 3: Border-Safe CAA-Res ("caa") or Haar-Res ("haar") on P3/P4
+    v3_neck_variant: str = "caa"             # "caa" (+11.8K params) or "haar" (+8.6K params)
+    v3_neck_indices: tuple[int, ...] = (16, 19)
+    v3_caa_reduction: int = 4
+    v3_caa_pool_kernel: int = 7
+    v3_caa_strip_kernel: int = 11
 
     # --- Extra Ultralytics train kwargs ---
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
@@ -412,6 +452,248 @@ PRESETS: Dict[str, ExperimentConfig] = {
         epochs=200,
         batch=32,
     ),
+
+    # =========================================================================
+    # Phase 1 V3: Unified IR-Clean Protocol + Orthogonal 3-Pillar Breakthrough
+    #   Shared IR-Clean baseline: hsv_h=0, hsv_s=0, hsv_v=0.25, erasing=0.0,
+    #   close_mosaic=15, deterministic=True, cache="disk", align_val_rect_false=True.
+    #   Preserves 708/708 pretrained weights & zero collision with 2026 competitors!
+    # =========================================================================
+    "v3_e0_base": ExperimentConfig(
+        exp_name="v3_e0_base",
+        phase="v3",
+        notes="V3 E0 IR-Clean Baseline YOLO26n (AdamW auto, hsv_h/s=0, hsv_v=0.25, erasing=0, val rect=F)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+    ),
+    "v3_e1_p1_distill": ExperimentConfig(
+        exp_name="v3_e1_p1_distill",
+        phase="v3",
+        notes="V3 E1 Pillar 1a+1b: Protected-Floor ProgLoss (o2m>=0.45) + Selective O2M->O2O KD (0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_prog_floor=True,
+        v3_o2m_kd=True,
+    ),
+    "v3_e2_p1_piou": ExperimentConfig(
+        exp_name="v3_e2_p1_piou",
+        phase="v3",
+        notes="V3 E2 Pillar 1c (PIoU2): O2O-only Annealed NWD(A0=256) + Dead-Anchor Floor + PIoU2 (0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="piou2",
+    ),
+    "v3_e2b_p1_sdloss": ExperimentConfig(
+        exp_name="v3_e2b_p1_sdloss",
+        phase="v3",
+        notes="V3 E2b Pillar 1c (AAAI25 SD Loss): O2O-only Annealed NWD(A0=256) + Dead-Anchor Floor + SDB (0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="sdloss",
+    ),
+    "v3_e3_p1_full": ExperimentConfig(
+        exp_name="v3_e3_p1_full",
+        phase="v3",
+        notes="V3 E3 Full Pillar 1 ODCS (ProgFloor + O2M->O2O KD + O2O Anneal + PIoU2, +0 params / +0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_prog_floor=True,
+        v3_o2m_kd=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="piou2",
+    ),
+    "v3_e3b_p1_full_sd": ExperimentConfig(
+        exp_name="v3_e3b_p1_full_sd",
+        phase="v3",
+        notes="V3 E3b Full Pillar 1 ODCS (ProgFloor + O2M->O2O KD + O2O Anneal + SD Loss, +0 params / +0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_prog_floor=True,
+        v3_o2m_kd=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="sdloss",
+    ),
+    "v3_e4_bitc_safe": ExperimentConfig(
+        exp_name="v3_e4_bitc_safe",
+        phase="v3",
+        notes="V3 E4 Pillar 2: Border-Safe BiTC-Stem (replicate pad + Charbonnier @ Stage 1, +608 params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_bitc=True,
+    ),
+    "v3_e5_caa_res": ExperimentConfig(
+        exp_name="v3_e5_caa_res",
+        phase="v3",
+        notes="V3 E5 Pillar 3: Border-Safe CAA-Res (Avg7 + 1x11/11x1 strips @ Neck P3/P4, +11.8K params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
+    "v3_e5b_haar_res": ExperimentConfig(
+        exp_name="v3_e5b_haar_res",
+        phase="v3",
+        notes="V3 E5b Pillar 3 Fallback: Zero-Init 2D Haar-Res @ Neck P3/P4 (+8.6K params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_neck=True,
+        v3_neck_variant="haar",
+    ),
+    "v3_e6_arch_combo": ExperimentConfig(
+        exp_name="v3_e6_arch_combo",
+        phase="v3",
+        notes="V3 E6 Pillar 2+3 Orthogonality Check: Border-Safe BiTC-Stem + CAA-Res (+12.4K params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_bitc=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
+    "v3_e7_full": ExperimentConfig(
+        exp_name="v3_e7_full",
+        phase="v3",
+        notes="V3 E7 Full Model (Pillar 1 ODCS-PIoU2 + Pillar 2 BiTC-Safe + Pillar 3 CAA-Res)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_prog_floor=True,
+        v3_o2m_kd=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="piou2",
+        use_v3_bitc=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
+    "v3_e7b_full_sd": ExperimentConfig(
+        exp_name="v3_e7b_full_sd",
+        phase="v3",
+        notes="V3 E7b Full Model (Pillar 1 ODCS-SDLoss + Pillar 2 BiTC-Safe + Pillar 3 CAA-Res)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        epochs=200,
+        batch=32,
+        close_mosaic=15,
+        cache="disk",
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.25,
+        erasing=0.0,
+        align_val_rect_false=True,
+        use_v3_odcs=True,
+        v3_prog_floor=True,
+        v3_o2m_kd=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="sdloss",
+        use_v3_bitc=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
 }
 
 
@@ -472,6 +754,21 @@ def list_presets() -> str:
             flags.append("C1")
         if cfg.use_mod_c2:
             flags.append("C2")
+        if cfg.use_v3_odcs:
+            sub = []
+            if cfg.v3_prog_floor:
+                sub.append("PF")
+            if cfg.v3_o2m_kd:
+                sub.append("KD")
+            if cfg.v3_o2o_annealed_assign:
+                sub.append("AA")
+            if cfg.v3_reg_loss_type != "ciou":
+                sub.append(cfg.v3_reg_loss_type.upper())
+            flags.append("ODCS(" + ",".join(sub) + ")")
+        if cfg.use_v3_bitc:
+            flags.append("BiTC_v3")
+        if cfg.use_v3_neck:
+            flags.append(f"Neck_{cfg.v3_neck_variant}")
         flag_str = "+".join(flags) if flags else "baseline"
         lines.append(
             f"  - {name:<26} [{cfg.phase:<6}] model={cfg.model_cfg:<30} mods={flag_str:<10} ({cfg.notes})"

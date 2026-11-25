@@ -1,14 +1,16 @@
-"""Model builder and Phase 1 / V2 switch dispatcher.
+"""Model builder and Phase 1 / V2 / V3 switch dispatcher.
 
 All patches verified against installed `ultralytics 8.4.218`:
-- Mod A v1 (`use_mod_a`): Pruned P5 PAN+Head + P2-P4 YAML (kept as negative empirical control).
-- Mod A v2 (`use_tc_gate`): Zero-Init Thermal Clutter Suppression Gate (`TC-Gate`) wrapped on
-  pretrained neck P3/P4 (#16, #19) AFTER `setup_model()` -> preserves 708/708 pretrained weights!
-- Mod B (`use_mod_b`):
-    - `mod_b_variant="v2"` (`BiTC-Stem`, recommended): Band-pass `|Avg3 - Avg5|` on Stage 1 only.
-    - `mod_b_variant="v1"` (legacy): Max/Min/Avg TCAD on Stages (0, 1).
-- Mod C1/C2 (`use_mod_c1`, `use_mod_c2`): FP32 Decoupled Scale-Gated NWD (`DSG-NWD`) hooked
-  into `E2ELoss` (`one2many` + `one2one`) during training only (zero inference overhead).
+- Legacy V1/V2 switches remain 100% intact for reproducibility & checkpoint loading.
+- V3 switches (strictly pretrained-preserving 708/708 + zero-init residual + border-safe):
+  - Pillar 1 (`use_v3_odcs`): Zero-inference-overhead `ODCS` supervision (Protected-Floor
+    ProgLoss + Selective O2M->O2O Self-Distillation + O2O-only Annealed Assignment with
+    dead-anchor floor + PIoU2 / AAAI 2025 SD Loss).
+  - Pillar 2 (`use_v3_bitc`): `BorderSafeBiTCStemWrapper` on Stage 1 (+608 params).
+  - Pillar 3 (`use_v3_neck`): `BorderSafeCAAResWrapper` (`"caa"`, +11.8K params) or
+    `HaarResWrapper` (`"haar"`, +8.6K params) on Neck P3/P4 (#16, #19).
+  - Protocol alignment (`align_val_rect_false`): Forces in-training val dataloader to use
+    `rect=False` (640x640) matching test_o2o_640 so `best.pt` selection has zero border drift.
 """
 
 from __future__ import annotations
@@ -20,38 +22,98 @@ from configs.experiments import ExperimentConfig
 from src.modules.nwd_e2e import attach_nwd_e2e_hook
 from src.modules.tc_gate import inject_tc_gate_into_model
 from src.modules.tcad import inject_tcad_into_model
+from src.modules.v3_arch import inject_v3_bitc_into_model, inject_v3_neck_into_model
+from src.modules.v3_losses import V3ODCSConfig, attach_v3_odcs_hook
 
 
 def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
-    """Attach structural (BiTC-Stem / TC-Gate) and supervision (DSG-NWD) hooks."""
-    if cfg.use_mod_b or cfg.use_tc_gate:
+    """Attach structural (V1/V2/V3), protocol alignment, and supervision hooks."""
+    needs_struct = cfg.use_mod_b or cfg.use_tc_gate or cfg.use_v3_bitc or cfg.use_v3_neck
+    if needs_struct or cfg.align_val_rect_false:
         def _on_pretrain_routine_start(trainer: Any) -> None:
-            orig_setup_model = trainer.setup_model
+            if needs_struct:
+                orig_setup_model = trainer.setup_model
 
-            def _wrapped_setup_model() -> Any:
-                ckpt = orig_setup_model()
-                if cfg.use_mod_b:
-                    inject_tcad_into_model(
-                        trainer.model,
-                        stages=cfg.mod_b_stages,
-                        variant=cfg.mod_b_variant,
-                    )
-                if cfg.use_tc_gate:
-                    inject_tc_gate_into_model(
-                        trainer.model,
-                        neck_indices=cfg.tc_gate_indices,
-                    )
-                return ckpt
+                def _wrapped_setup_model() -> Any:
+                    ckpt = orig_setup_model()
+                    # Legacy V1/V2 structural hooks
+                    if cfg.use_mod_b:
+                        inject_tcad_into_model(
+                            trainer.model,
+                            stages=cfg.mod_b_stages,
+                            variant=cfg.mod_b_variant,
+                        )
+                    if cfg.use_tc_gate:
+                        inject_tc_gate_into_model(
+                            trainer.model,
+                            neck_indices=cfg.tc_gate_indices,
+                        )
+                    # V3 orthogonal border-safe structural hooks
+                    if cfg.use_v3_bitc:
+                        inject_v3_bitc_into_model(
+                            trainer.model,
+                            stages=cfg.v3_bitc_stages,
+                        )
+                    if cfg.use_v3_neck:
+                        inject_v3_neck_into_model(
+                            trainer.model,
+                            neck_indices=cfg.v3_neck_indices,
+                            variant=cfg.v3_neck_variant,
+                            reduction=cfg.v3_caa_reduction,
+                            pool_kernel=cfg.v3_caa_pool_kernel,
+                            strip_kernel=cfg.v3_caa_strip_kernel,
+                        )
+                    return ckpt
 
-            trainer.setup_model = _wrapped_setup_model
+                trainer.setup_model = _wrapped_setup_model
+
+            # Align in-training validation (`best.pt` selection) to rect=False (640x640)
+            # without touching training `mosaic=1.0`!
+            if cfg.align_val_rect_false and hasattr(trainer, "build_dataset"):
+                import inspect
+
+                orig_build_dataset = trainer.build_dataset
+
+                def _val_square_build_dataset(img_path: Any, mode: str = "train", batch: Any = None) -> Any:
+                    if mode == "val":
+                        try:
+                            from ultralytics.data import build_yolo_dataset
+
+                            sig_params = set(inspect.signature(build_yolo_dataset).parameters.keys())
+                            m = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+                            gs = max(int(m.stride.max() if hasattr(m, "stride") else 32), 32)
+                            kwargs = {
+                                "mode": "val",
+                                "rect": False,
+                                "stride": gs,
+                            }
+                            if "multi_modal" in sig_params:
+                                kwargs["multi_modal"] = False
+                            ds = build_yolo_dataset(
+                                trainer.args,
+                                img_path,
+                                batch,
+                                trainer.data,
+                                **{k: v for k, v in kwargs.items() if k in sig_params},
+                            )
+                            print("[IR-CLEAN] Built square rect=False (640x640) in-training validation dataset.")
+                            return ds
+                        except Exception as exc:
+                            print(f"[WARN] Could not rebuild val dataset with rect=False ({exc}); falling back.")
+                    return orig_build_dataset(img_path, mode=mode, batch=batch)
+
+                trainer.build_dataset = _val_square_build_dataset
 
         model.add_callback("on_pretrain_routine_start", _on_pretrain_routine_start)
-        print(
-            f"[STRUCT HOOK] Registered setup_model wrapper: "
-            f"BiTC({cfg.mod_b_variant})={cfg.use_mod_b}@{cfg.mod_b_stages}, "
-            f"TC-Gate={cfg.use_tc_gate}@{cfg.tc_gate_indices}"
-        )
+        if needs_struct:
+            print(
+                f"[STRUCT HOOK] Registered setup_model wrapper: "
+                f"V2(BiTC={cfg.use_mod_b}, TCGate={cfg.use_tc_gate}) | "
+                f"V3(BorderSafeBiTC={cfg.use_v3_bitc}@{cfg.v3_bitc_stages}, "
+                f"Neck={cfg.use_v3_neck}:{cfg.v3_neck_variant}@{cfg.v3_neck_indices})"
+            )
 
+    # Legacy V2 DSG-NWD hook
     if cfg.use_mod_c1 or cfg.use_mod_c2:
         attach_nwd_e2e_hook(
             model,
@@ -62,6 +124,32 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
             w_max=cfg.nwd_w_max,
             c=cfg.nwd_constant_c,
         )
+
+    # V3 Pillar 1 (ODCS) hook
+    if cfg.use_v3_odcs:
+        odcs_cfg = V3ODCSConfig(
+            use_prog_floor=cfg.v3_prog_floor,
+            o2m_floor=cfg.v3_o2m_floor,
+            o2o_ramp_frac=cfg.v3_o2o_ramp_frac,
+            use_o2m_kd=cfg.v3_o2m_kd,
+            kd_weight=cfg.v3_kd_weight,
+            kd_sup_weight=cfg.v3_kd_sup_weight,
+            kd_warmup_epochs=cfg.v3_kd_warmup_epochs,
+            kd_topk_runners=cfg.v3_kd_topk_runners,
+            use_o2o_annealed_assign=cfg.v3_o2o_annealed_assign,
+            area_thresh=cfg.v3_nwd_area_thresh,
+            tau=cfg.v3_nwd_tau,
+            w_max=cfg.v3_nwd_w_max,
+            nwd_c=cfg.v3_nwd_c,
+            anneal_frac=cfg.v3_anneal_frac,
+            reg_floor_eps=cfg.v3_reg_floor_eps,
+            reg_loss_type=cfg.v3_reg_loss_type,
+            piou_lambda=cfg.v3_piou_lambda,
+            sd_delta=cfg.v3_sd_delta,
+            sd_b_max=cfg.v3_sd_b_max,
+            reg_both_heads=cfg.v3_reg_both_heads,
+        )
+        attach_v3_odcs_hook(model, odcs_cfg)
 
 
 def build_model_with_switches(cfg: ExperimentConfig, repo_root: Path) -> Any:
@@ -75,9 +163,8 @@ def build_model_with_switches(cfg: ExperimentConfig, repo_root: Path) -> Any:
 
     print(
         f"[MODEL] Loading {model_spec} | "
-        f"ModA_v1={cfg.use_mod_a} TC-Gate={cfg.use_tc_gate} "
-        f"ModB({cfg.mod_b_variant})={cfg.use_mod_b} "
-        f"C1={cfg.use_mod_c1} C2={cfg.use_mod_c2}"
+        f"V2(A1={cfg.use_mod_a}, TCGate={cfg.use_tc_gate}, B={cfg.use_mod_b}, C1={cfg.use_mod_c1}, C2={cfg.use_mod_c2}) | "
+        f"V3(ODCS={cfg.use_v3_odcs}, BiTC={cfg.use_v3_bitc}, Neck={cfg.use_v3_neck}:{cfg.v3_neck_variant})"
     )
     model = YOLO(model_spec)
 

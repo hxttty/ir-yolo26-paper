@@ -244,6 +244,24 @@ def evaluate_checkpoint(
         except Exception as exc:
             print(f"[WARN] Rectangular 640x512 eval failed: {exc}")
 
+    # 3b. Compute anti-noise 3-Class Main Avg (Person/Car/Bicycle, 99.4% of HIT-UAV test instances)
+    primary_test = summary["evals"].get("test_o2o_640" if is_e2e_model else "test_nms_640", {})
+    pc50 = primary_test.get("per_class_ap50", {})
+    main3_vals = [pc50[c] for c in ("Person", "Car", "Bicycle") if c in pc50]
+    if len(main3_vals) == 3:
+        summary["test_3cls_mAP50"] = round(sum(main3_vals) / 3.0, 5)
+
+    o2m_test = summary["evals"].get("test_o2m_640", {})
+    if o2m_test:
+        summary["test_o2m_mAP50"] = o2m_test.get("mAP50")
+        summary["test_o2m_mAP50_95"] = o2m_test.get("mAP50_95")
+
+    rect_test = summary["evals"].get("test_o2o_rect640x512" if is_e2e_model else "test_nms_rect640x512", {})
+    if rect_test and primary_test:
+        summary["test_rect_minus_square_mAP50"] = round(
+            float(rect_test.get("mAP50", 0.0)) - float(primary_test.get("mAP50", 0.0)), 5
+        )
+
     # 4. Optional ONNX CPU edge latency benchmark
     if export_onnx_bench:
         summary["onnx_bench"] = {}
@@ -287,6 +305,17 @@ def _append_master_csv(summary: Dict[str, Any], csv_path: Path) -> None:
     pc50 = test_m.get("per_class_ap50", {})
     onnx_rect = summary.get("onnx_bench", {}).get("512x640", {})
 
+    extra_tags: List[str] = []
+    if "test_3cls_mAP50" in summary:
+        extra_tags.append(f"3cls={summary['test_3cls_mAP50']*100:.2f}%")
+    if summary.get("test_o2m_mAP50") is not None:
+        extra_tags.append(f"O2M={summary['test_o2m_mAP50']*100:.2f}%")
+    if summary.get("test_rect_minus_square_mAP50") is not None:
+        extra_tags.append(f"rect-sq={summary['test_rect_minus_square_mAP50']*100:+.2f}%")
+    notes_str = summary.get("notes", "")
+    if extra_tags:
+        notes_str = f"{notes_str} [{' | '.join(extra_tags)}]".strip()
+
     row = {
         "timestamp": summary["timestamp"],
         "exp_name": summary["exp_name"],
@@ -315,7 +344,7 @@ def _append_master_csv(summary: Dict[str, Any], csv_path: Path) -> None:
         "rect640x512_mAP50": rect_m.get("mAP50", ""),
         "rect640x512_total_ms": rect_m.get("total_ms", ""),
         "onnx_cpu_512x640_ms": onnx_rect.get("cpu_latency_ms", ""),
-        "notes": summary.get("notes", ""),
+        "notes": notes_str,
     }
 
     fieldnames = list(row.keys())
@@ -349,11 +378,20 @@ def _print_compact_table(summary: Dict[str, Any]) -> None:
         f"total={tm.get('total_ms', 0):.2f}ms ({tm.get('fps', 0):.1f} FPS)"
     )
     if "test_delta_e2e_map50" in summary:
+        o2m_s = (
+            f" | O2M Ceiling={summary['test_o2m_mAP50']:.4f}/{summary['test_o2m_mAP50_95']:.4f}"
+            if summary.get("test_o2m_mAP50") is not None
+            else ""
+        )
         print(
             f"  End-to-End Gap Δ_E2E (O2M - O2O): "
             f"ΔmAP50={summary['test_delta_e2e_map50']:+.4f} | "
-            f"ΔmAP50-95={summary['test_delta_e2e_map50_95']:+.4f}"
+            f"ΔmAP50-95={summary['test_delta_e2e_map50_95']:+.4f}{o2m_s}"
         )
+    if "test_3cls_mAP50" in summary:
+        rect_gap = summary.get("test_rect_minus_square_mAP50")
+        gap_s = f" | Rect640x512-Sq={rect_gap:+.4f}" if rect_gap is not None else ""
+        print(f"  Anti-Noise 3-Class Main Avg (Person/Car/Bicycle): {summary['test_3cls_mAP50']:.4f}{gap_s}")
     pc = tm.get("per_class_ap50", {})
     if pc:
         cls_str = " | ".join(f"{k}={v:.4f}" for k, v in pc.items())

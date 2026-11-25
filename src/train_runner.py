@@ -189,8 +189,13 @@ def run_experiment(
             "save": True,
             "save_period": -1,  # Keep disk clean; our callback backs up last.pt + best.pt to Drive
             "plots": True,
-            **cfg.extra_train_kwargs,
         }
+        # Apply optional IR-Clean augmentation overrides when explicitly specified in preset
+        for opt_key in ("hsv_h", "hsv_s", "hsv_v", "erasing"):
+            val = getattr(cfg, opt_key, None)
+            if val is not None:
+                train_kwargs[opt_key] = val
+        train_kwargs.update(cfg.extra_train_kwargs)
         model.train(**train_kwargs)
 
     train_minutes = (time.perf_counter() - t_start) / 60.0
