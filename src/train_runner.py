@@ -305,6 +305,21 @@ def main() -> None:
         print(list_presets())
         return
 
+    # Magic meta-preset: lets Colab Cell 1 run the full autonomous Phase 3 overnight
+    # decision tree via `EXP_LIST = ["auto_phase3_overnight"]` with ZERO notebook edits!
+    if args.exp == "auto_phase3_overnight":
+        from src.run_phase3_auto import run_overnight_orchestrator
+
+        run_overnight_orchestrator(
+            dataset_root=args.dataset_root,
+            work_dir=args.work_dir,
+            drive_dir=args.drive_dir,
+            resume=not args.no_resume,
+            smoke_only=bool(args.smoke_test),
+            export_onnx=bool(args.export_onnx),
+        )
+        return
+
     # Support inline per-item seed syntax in Colab EXP_LIST: e.g. "v33_e0_base@s0"
     exp_arg = args.exp
     seed_override = args.seed
