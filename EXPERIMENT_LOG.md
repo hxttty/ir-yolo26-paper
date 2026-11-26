@@ -83,4 +83,10 @@
   - **关键破案与 V3.2 修正（2026-11-26 12:15 JST）**：
     - 相对 `v31_e0_base`，三大支柱全员正增益且把 `Δ_E2E` 从 `+2.06% / +1.40%` 压至 `+0.44%~+0.61% / +0.30%`；
     - **但 `v31_e0_base`（纯官方模型）比 `p0_yolo26n_musgd`（`87.67/57.51`, O2M `89.98%`）低了 `-3.41% / -3.32%`**；逐行 diff 锁定元凶为 `align_val_rect_false=True`（+ `cache="disk"` + `hsv_h/s=0` + `8.4.219`）导致 Ep 69 锁死次优 `best.pt`（而 `p0` 在 `val rect=True` 下于 Ep 84 选出 `Val 93.2/63.5`）。
-    - 已新增 **V3.2 官方零漂移协议预设**（`v32_e0_base`, `v32_e1_p1c_piou`, `v32_e2_bitc_safe`, `v32_e3_caa_res`, `v32_e4_arch_combo`, `v32_e5_champion`：`val rect=True, cache=True`, 官方默认 aug），立即在热 L4 跑 `["v32_e0_base", "v32_e1_p1c_piou", "v32_e5_champion"]` 验血夺回 90% O2M 高底座！
+    - 已新增 **V3.2 官方零漂移协议预设**（`v32_e0_base`, `v32_e1_p1c_piou`, `v32_e2_bitc_safe`, `v32_e3_caa_res`, `v32_e4_arch_combo`, `v32_e5_champion`：`val rect=True, cache=True`, 官方默认 aug），实测完赛（2026-11-26 12:20–14:42 JST, L4, `seed=42`, `Ultralytics 8.4.219`）：
+      - `v32_e0_base`（Best Ep **84**/134）：Val `90.38/60.62`，**Test O2O `87.29% / 57.39%`**，**Test O2M `89.59% / 59.17%`**，`Δ_E2E +2.30% / +1.78%`，`3cls 92.68%`（100% 复现 `p0`，彻底证实之前低 3.4% 是 `align_val_rect_false=True` 导致）；
+      - `v32_e1_p1c_piou`（Best Ep **97**/147）：Val **`91.31/60.98`** (`+0.93/+0.36`)，Test O2O `86.71% / 55.97%` (`-0.58/-1.42`)，Test O2M `86.86% / 56.63%` (`-2.73/-2.54`)，`Δ_E2E +0.15% / +0.66%`；
+      - `v32_e5_champion`（Best Ep **161**/200）：Val **`92.09/61.23`** (`+1.71/+0.61` 历史最高)，Test O2O `86.20% / 56.24%` (`-1.09/-1.15`)，Test O2M `86.22% / 56.37%` (`-3.37/-2.80`)，`Δ_E2E +0.02% / +0.13%`。
+  - **V3.3 方案 A（100-Epoch 余弦退火 + Clean Close-Mosaic + 剥离 PIoU2，2026-11-26 15:08 JST）**：
+    - 诊断：`epochs=200` 线性衰减在 2,029 张 HIT-UAV 上导致 `e1/e5` 拖到 Ep 97/161 过拟合 290 张 Val（Val→Test 落差扩大到 `-5.89%`）且从未触发最后 10 轮 `close_mosaic` 干净精调；同时排查 `PIoU2` 削弱高 IoU 梯度对 `mAP50-95` 的伤害。
+    - 已新增 `v33_e0_base`, `v33_e1_p1c_ciou`, `v33_e1b_p1c_piou`, `v33_e2_arch_combo`, `v33_e3_full_ciou`（`epochs=100, patience=100, cos_lr=True, close_mosaic=10, val rect=True`），立即在热 L4 跑 4 组（~1.6 小时）！
