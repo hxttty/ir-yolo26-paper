@@ -160,11 +160,16 @@ class ExperimentConfig:
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
 
     def apply_smoke_test(self) -> "ExperimentConfig":
-        """Shrink run to a ~60-90s end-to-end sanity check without mutating presets."""
+        """Shrink run to a ~60-90s end-to-end sanity check without mutating presets.
+
+        For KD runs (`use_kd=True`), preserves the formal `batch` size so Gate 1 verifies
+        exact peak VRAM under the real training batch size.
+        """
         if self.smoke_test:
             self.epochs = 2
             self.patience = 2
-            self.batch = min(self.batch, 16)
+            if not self.use_kd:
+                self.batch = min(self.batch, 16)
             self.close_mosaic = 0
             self.save_period = -1
             self.export_onnx_bench = False

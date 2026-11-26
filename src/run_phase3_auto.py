@@ -1,38 +1,23 @@
 """Autonomous Phase 3 Overnight Experiment Orchestrator for HIT-UAV YOLO26 KD.
 
-Zero-babysitting, CU-safe decision engine callable in two ways:
-  1. Direct Colab Notebook zero-edit mode: set `EXP_LIST = ["auto_phase3_overnight"]`
-     (with `SMOKE_TEST = False`, `AUTO_UNASSIGN = True`).
+Zero-babysitting, CU-safe, leak-free decision engine callable in two ways:
+  1. Direct Colab Notebook zero-edit mode: set `EXP_LIST = ["auto_phase3_overnight"]`,
+     `SMOKE_TEST = False`, `AUTO_UNASSIGN = True`.
   2. Standalone CLI:
      `python -m src.run_phase3_auto --dataset-root /content/datasets --work-dir /content/work --drive-dir /content/drive/MyDrive/ir-yolo26-paper`
 
-Decision Tree:
-  - Gate 0 (Teacher Selector): Compares Drive-archived `teacher_yolo26s` vs `teacher_yolo26m`
-    by composite accuracy (`0.45*mAP50 + 0.45*mAP50-95 + 0.10*3cls`) and auto-locks best teacher.
-  - Gate 1 (2-Epoch Smoke Lock): Runs 2-epoch `p3_kd_full_{t}` and strictly asserts:
-      (a) exit code == 0 & finite metrics, and
-      (b) exported `best.pt` has `params_M <= 2.55` (proving +0 teacher/adapter leakage!).
-    Aborts immediately on failure to protect Colab CUs.
-  - Gate 2 (Core Probe Trio @ seed=42): Runs `full`, `full_norun`, and `m12_cross`, comparing
-    each against `v33_e0_base` (`86.48% / 56.34% / 3cls 92.83%`).
-    - If none clears the anti-noise improvement gate -> auto-runs `0.3x` gentle rescue
-      (`p3_kd_gentle_{t}`) + pure `M1` (`p3_kd_m1_fpkd_{t}`).
-  - Gate 3 (Branch Execution):
-    - Scenario A/B (Promising WINNER found):
-        1. Complete remaining single-module ablations (`M1 F-PKD`, `M3 QG-Head`) @ `seed=42`.
-        2. Run 3-seed paired audit (`WINNER@s0`, `WINNER@s3407`) & compute paired `t-test`
-           vs existing `v33_e0_base` (`42, 0, 3407`).
-        3. Run 3 fair 2026 KD baselines (`Official PR#24894 L2`, `QG-KD 1-IoU`, `CWD`).
-        4. Run 4 unified 100-ep SOTA baselines (`YOLOv8n`, `YOLOv10n`, `YOLO11n`, `YOLO12n`).
-        5. Bonus 5-seed upgrade (`seeds=2025, 2026` paired `base` + `WINNER`) ONLY if 3-seed
-           paired gain holds cleanly AND remaining time budget allows!
-    - Scenario C (2K HIT-UAV saturation brake):
-        Skips multi-seed KD repeats to save Colab CUs; runs ONLY the 4 universally needed SOTA
-        baselines (`YOLOv8n/10n/11n/12n`), writes an honest diagnostic report to Drive, and exits
-        cleanly so `AUTO_UNASSIGN=True` releases the GPU immediately.
-
-Every sub-experiment executes in an isolated subprocess (`python -m src.train_runner ...`) for
-zero VRAM fragmentation, full `_COMPLETED.flag` resume safety, and live Drive archiving.
+Hardened against all adversarial audit edge cases:
+  - STRICT Validation-only model/teacher/winner selection (ZERO test-set leakage into branching!).
+  - Strict fail-fast on ANY non-zero subprocess exit or NaN/missing metrics (NEVER mislabels
+    crashes as `SCENARIO_C_BRAKE`!).
+  - Hard per-subprocess wall-clock timeout bounded by remaining `--max-hours` budget so a hung
+    training or Drive I/O call forcefully exits in time for `AUTO_UNASSIGN=True`.
+  - Gate 1 verifies: (a) formal batch size (`batch=32`) peak VRAM & finite metrics,
+    (b) `kd_health.json` confirms `adapter_steps >= 1` & `total_kd_batches >= 1`, and
+    (c) exported `best.pt` purity check (zero `kd_yolo26` / `NeckChannelAdapters` refs,
+    native `YOLO26n` state_dict keys, and `params_M <= 2.55`).
+  - Missing optional fields (`rect_map50`, `delta_e2e_50`) stay `NaN` (never silently replaced),
+    and malformed/empty local JSON falls through cleanly to Drive JSON / `master_results.csv`.
 """
 
 from __future__ import annotations
@@ -44,17 +29,42 @@ import math
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-# Default fallback metrics for `v33_e0_base` (HIT-UAV 4cls, 100ep cos_lr) verified on Drive
+# Verified `v33_e0_base` metrics on HIT-UAV 4cls (100ep cos_lr, Drive master_results.csv)
 _FALLBACK_BASE_METRICS: Dict[int, Dict[str, float]] = {
-    42: {"mAP50": 0.86475, "mAP50_95": 0.56341, "main3": 0.92829, "rect50": 0.85973, "delta_e2e_50": 0.00730},
-    0: {"mAP50": 0.85492, "mAP50_95": 0.56322, "main3": 0.92763, "rect50": 0.85627, "delta_e2e_50": 0.01285},
-    3407: {"mAP50": 0.87924, "mAP50_95": 0.56690, "main3": 0.92458, "rect50": 0.87733, "delta_e2e_50": 0.00913},
+    42: {
+        "val_mAP50": 0.90641,
+        "val_mAP50_95": 0.60549,
+        "mAP50": 0.86475,
+        "mAP50_95": 0.56341,
+        "main3": 0.92829,
+        "rect50": 0.85973,
+        "delta_e2e_50": 0.00730,
+    },
+    0: {
+        "val_mAP50": 0.89981,
+        "val_mAP50_95": 0.59867,
+        "mAP50": 0.85492,
+        "mAP50_95": 0.56322,
+        "main3": 0.92763,
+        "rect50": 0.85627,
+        "delta_e2e_50": 0.01285,
+    },
+    3407: {
+        "val_mAP50": 0.90188,
+        "val_mAP50_95": 0.58902,
+        "mAP50": 0.87924,
+        "mAP50_95": 0.56690,
+        "main3": 0.92458,
+        "rect50": 0.87733,
+        "delta_e2e_50": 0.00913,
+    },
 }
 
 
@@ -75,7 +85,7 @@ class RunMetrics:
     def is_finite(self) -> bool:
         return all(
             math.isfinite(v)
-            for v in (self.params_m, self.test_map50, self.test_map50_95, self.val_map50, self.val_map50_95)
+            for v in (self.params_m, self.val_map50, self.val_map50_95, self.test_map50, self.test_map50_95)
         )
 
 
@@ -88,48 +98,63 @@ def _safe_float(val: Any, default: float = float("nan")) -> float:
         return default
 
 
+def _fmt_pct(val: float, signed: bool = False) -> str:
+    if not math.isfinite(val):
+        return "N/A"
+    return f"{val*100:+.2f}%" if signed else f"{val*100:.2f}%"
+
+
 def load_run_metrics(
     exp_dir_name: str,
     *,
     work_dir: Path,
     drive_dir: Optional[Path],
 ) -> Optional[RunMetrics]:
-    """Read metrics for `exp_dir_name` from `eval_summary.json` (local/Drive) or `master_results.csv`."""
+    """Read metrics for `exp_dir_name` from `eval_summary.json` (local/Drive) or `master_results.csv`.
+
+    Never substitutes missing optional fields (`rect_map50`, `delta_e2e_50`) with fake values,
+    and falls through to the next source if a JSON file is empty/malformed/non-finite.
+    """
     json_candidates: List[Path] = [work_dir / "runs" / exp_dir_name / "eval_summary.json"]
     if drive_dir is not None:
         json_candidates.append(drive_dir / "runs" / exp_dir_name / "eval_summary.json")
 
     for jp in json_candidates:
-        if jp.is_file():
-            try:
-                data = json.loads(jp.read_text(encoding="utf-8"))
-                is_e2e = bool(data.get("is_e2e_model", True))
-                evals = data.get("evals", {}) or {}
-                val_d = evals.get("val_o2o_640" if is_e2e else "val_nms_640", {}) or {}
-                test_d = evals.get("test_o2o_640" if is_e2e else "test_nms_640", {}) or {}
-                rect_d = evals.get("test_o2o_rect640x512" if is_e2e else "test_nms_rect640x512", {}) or {}
-                main3 = _safe_float(data.get("test_3cls_mAP50"))
-                if not math.isfinite(main3):
-                    pc = test_d.get("per_class_ap50", {}) or {}
-                    vals = [_safe_float(pc.get(c)) for c in ("Person", "Car", "Bicycle")]
-                    main3 = sum(vals) / 3.0 if all(math.isfinite(v) for v in vals) else float("nan")
-                return RunMetrics(
-                    exp_name=exp_dir_name,
-                    params_m=_safe_float(data.get("params_M")),
-                    gflops=_safe_float(data.get("gflops"), 0.0),
-                    val_map50=_safe_float(val_d.get("mAP50")),
-                    val_map50_95=_safe_float(val_d.get("mAP50_95")),
-                    test_map50=_safe_float(test_d.get("mAP50")),
-                    test_map50_95=_safe_float(test_d.get("mAP50_95")),
-                    test_main3=main3,
-                    rect_map50=_safe_float(rect_d.get("mAP50"), _safe_float(test_d.get("mAP50"))),
-                    delta_e2e_50=_safe_float(data.get("test_delta_e2e_map50"), 0.0),
-                    total_ms=_safe_float(test_d.get("total_ms"), 0.0),
-                )
-            except Exception as exc:
-                print(f"[AUTO WARN] Failed parsing {jp}: {exc}")
+        if not jp.is_file():
+            continue
+        try:
+            data = json.loads(jp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not data.get("evals"):
+                continue
+            is_e2e = bool(data.get("is_e2e_model", True))
+            evals = data.get("evals", {}) or {}
+            val_d = evals.get("val_o2o_640" if is_e2e else "val_nms_640", {}) or {}
+            test_d = evals.get("test_o2o_640" if is_e2e else "test_nms_640", {}) or {}
+            rect_d = evals.get("test_o2o_rect640x512" if is_e2e else "test_nms_rect640x512", {}) or {}
+            main3 = _safe_float(data.get("test_3cls_mAP50"))
+            if not math.isfinite(main3):
+                pc = test_d.get("per_class_ap50", {}) or {}
+                vals = [_safe_float(pc.get(c)) for c in ("Person", "Car", "Bicycle")]
+                main3 = sum(vals) / 3.0 if all(math.isfinite(v) for v in vals) else float("nan")
+            m = RunMetrics(
+                exp_name=exp_dir_name,
+                params_m=_safe_float(data.get("params_M")),
+                gflops=_safe_float(data.get("gflops")),
+                val_map50=_safe_float(val_d.get("mAP50")),
+                val_map50_95=_safe_float(val_d.get("mAP50_95")),
+                test_map50=_safe_float(test_d.get("mAP50")),
+                test_map50_95=_safe_float(test_d.get("mAP50_95")),
+                test_main3=main3,
+                rect_map50=_safe_float(rect_d.get("mAP50")),
+                delta_e2e_50=_safe_float(data.get("test_delta_e2e_map50")),
+                total_ms=_safe_float(test_d.get("total_ms")),
+            )
+            if m.is_finite():
+                return m
+        except Exception as exc:
+            print(f"[AUTO WARN] Failed parsing {jp}: {exc}")
 
-    # Fallback: read the latest matching row from master_results.csv
+    # Fallback: read the latest matching finite row from master_results.csv
     csv_candidates: List[Path] = []
     if drive_dir is not None:
         csv_candidates.append(drive_dir / "results" / "master_results.csv")
@@ -151,21 +176,88 @@ def load_run_metrics(
             c_ap = _safe_float(last_row.get("test_AP50_Car"))
             b_ap = _safe_float(last_row.get("test_AP50_Bicycle"))
             main3 = (p_ap + c_ap + b_ap) / 3.0 if all(math.isfinite(v) for v in (p_ap, c_ap, b_ap)) else float("nan")
-            t50 = _safe_float(last_row.get("test_mAP50"))
-            return RunMetrics(
+            m = RunMetrics(
                 exp_name=exp_dir_name,
                 params_m=_safe_float(last_row.get("params_M")),
-                gflops=_safe_float(last_row.get("gflops"), 0.0),
+                gflops=_safe_float(last_row.get("gflops")),
                 val_map50=_safe_float(last_row.get("val_mAP50")),
                 val_map50_95=_safe_float(last_row.get("val_mAP50_95")),
-                test_map50=t50,
+                test_map50=_safe_float(last_row.get("test_mAP50")),
                 test_map50_95=_safe_float(last_row.get("test_mAP50_95")),
                 test_main3=main3,
-                rect_map50=_safe_float(last_row.get("rect640x512_mAP50"), t50),
-                delta_e2e_50=_safe_float(last_row.get("test_delta_E2E_mAP50"), 0.0),
-                total_ms=_safe_float(last_row.get("test_total_ms"), 0.0),
+                rect_map50=_safe_float(last_row.get("rect640x512_mAP50")),
+                delta_e2e_50=_safe_float(last_row.get("test_delta_E2E_mAP50")),
+                total_ms=_safe_float(last_row.get("test_total_ms")),
             )
+            if m.is_finite():
+                return m
     return None
+
+
+def load_kd_health(exp_dir_name: str, *, work_dir: Path, drive_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    cands = [work_dir / "runs" / exp_dir_name / "kd_health.json"]
+    if drive_dir is not None:
+        cands.append(drive_dir / "runs" / exp_dir_name / "kd_health.json")
+    for p in cands:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def verify_exported_student_purity(
+    exp_dir_name: str,
+    *,
+    work_dir: Path,
+    drive_dir: Optional[Path],
+    max_params_m: float = 2.55,
+) -> Tuple[bool, str]:
+    """Verify exported `best.pt` is 100% pure native `YOLO26n` (zero KD / adapter / teacher leakage)."""
+    cands = [work_dir / "runs" / exp_dir_name / "weights" / "best.pt"]
+    if drive_dir is not None:
+        cands.append(drive_dir / "runs" / exp_dir_name / "weights" / "best.pt")
+    best_pt = next((p for p in cands if p.is_file()), None)
+    if best_pt is None:
+        return False, f"Exported best.pt missing for {exp_dir_name}"
+
+    # 1. Inspect PyTorch zip/pickle byte stream directly for forbidden KD module strings
+    forbidden = (b"kd_yolo26", b"NeckChannelAdapters", b"YOLO26DistillCriterion", b"_FeatureCaptureHook")
+    try:
+        if zipfile.is_zipfile(best_pt):
+            with zipfile.ZipFile(best_pt, "r") as zf:
+                for member in zf.namelist():
+                    if member.endswith("data.pkl"):
+                        raw = zf.read(member)
+                        for tok in forbidden:
+                            if tok in raw:
+                                return False, f"Forbidden KD reference `{tok.decode()}` found in {best_pt.name}!"
+    except Exception as exc:
+        return False, f"Failed scanning {best_pt} archive: {exc}"
+
+    # 2. If torch is available (always true on Colab), also verify exact param count & state_dict purity
+    try:
+        import torch
+
+        ckpt = torch.load(str(best_pt), map_location="cpu", weights_only=False)
+        model_obj = (ckpt.get("ema") or ckpt.get("model")) if isinstance(ckpt, dict) else ckpt
+        if model_obj is None:
+            return False, f"No model/ema object inside {best_pt}"
+        sd = model_obj.state_dict()
+        bad_keys = [k for k in sd.keys() if any(w in k.lower() for w in ("adapter", "teacher", "kd_"))]
+        if bad_keys:
+            return False, f"Unexpected KD keys in best.pt state_dict: {bad_keys[:5]}"
+        n_params_m = sum(p.numel() for p in model_obj.parameters()) / 1e6
+        if n_params_m > max_params_m:
+            return False, f"Exported best.pt has {n_params_m:.4f}M params (> {max_params_m:.2f}M)"
+        return True, f"Pure native YOLO26n verified ({n_params_m:.4f}M params, {len(sd)} state_dict tensors, 0 KD refs)"
+    except ImportError:
+        return True, f"Pickle byte scan clean (0 KD refs in {best_pt.name})"
+    except Exception as exc:
+        return False, f"torch.load purity verification failed on {best_pt}: {exc}"
 
 
 def teacher_weights_exist(run_name: str, *, work_dir: Path, drive_dir: Optional[Path]) -> bool:
@@ -182,23 +274,20 @@ def select_best_teacher(
     has_s_weights: bool,
     has_m_weights: bool,
 ) -> Tuple[str, str]:
-    """Select best teacher tag (`'s'` or `'m'`) using balanced accuracy & stability score."""
+    """Select best teacher tag (`'s'` or `'m'`) STRICTLY on Validation metrics (zero test leakage)."""
     scored: List[Tuple[float, str, str]] = []
     for tag, m, has_w in (("s", metrics_s, has_s_weights), ("m", metrics_m, has_m_weights)):
         if not has_w:
             continue
-        if m is not None and m.is_finite() and m.test_map50 >= 0.85:
-            main3 = m.test_main3 if math.isfinite(m.test_main3) else m.test_map50
-            score = 0.45 * m.test_map50 + 0.45 * m.test_map50_95 + 0.10 * main3
+        if m is not None and m.is_finite() and m.val_map50 >= 0.85:
+            score = 0.35 * m.val_map50 + 0.65 * m.val_map50_95
             desc = (
-                f"teacher_yolo26{tag}: Test O2O={m.test_map50*100:.2f}%/{m.test_map50_95*100:.2f}%, "
-                f"3cls={main3*100:.2f}%, Rect={m.rect_map50*100:.2f}%, Δ_E2E={m.delta_e2e_50*100:+.2f}%, "
-                f"score={score:.5f}"
+                f"teacher_yolo26{tag}: Val={_fmt_pct(m.val_map50)}/{_fmt_pct(m.val_map50_95)} "
+                f"(val_score={score:.5f}; passive Test={_fmt_pct(m.test_map50)}/{_fmt_pct(m.test_map50_95)})"
             )
             scored.append((score, tag, desc))
         else:
-            # Weights exist without parsed metrics (rare fallback)
-            scored.append((0.0, tag, f"teacher_yolo26{tag}: weights found (metrics unavailable)"))
+            scored.append((0.0, tag, f"teacher_yolo26{tag}: weights found (val metrics unavailable)"))
 
     if not scored:
         raise FileNotFoundError(
@@ -207,28 +296,24 @@ def select_best_teacher(
     scored.sort(key=lambda x: x[0], reverse=True)
     best_score, best_tag, _ = scored[0]
     summary_str = " | ".join(item[2] for item in scored)
-    return best_tag, f"Selected teacher_yolo26{best_tag} (best_score={best_score:.5f}) [{summary_str}]"
+    return best_tag, f"Selected teacher_yolo26{best_tag} by Validation (val_score={best_score:.5f}) [{summary_str}]"
 
 
 def evaluate_candidate_vs_base(cand: RunMetrics, base: RunMetrics) -> Tuple[bool, float, str]:
-    """Strict anti-noise promotion gate comparing a KD candidate vs `v33_e0_base` (`seed=42`)."""
-    d50 = cand.test_map50 - base.test_map50
-    d95 = cand.test_map50_95 - base.test_map50_95
-    c3 = cand.test_main3 if math.isfinite(cand.test_main3) else cand.test_map50
-    b3 = base.test_main3 if math.isfinite(base.test_main3) else base.test_map50
-    d3c = c3 - b3
-    drect = cand.rect_map50 - base.rect_map50
+    """STRICT Validation-only promotion gate vs `v33_e0_base` (zero test-set leakage!)."""
+    dv50 = cand.val_map50 - base.val_map50
+    dv95 = cand.val_map50_95 - base.val_map50_95
 
-    rank_score = 0.35 * d50 + 0.40 * d95 + 0.15 * d3c + 0.10 * drect
-    passes_gain = (d50 >= 0.0050) or (d95 >= 0.0040) or (drect >= 0.0100 and d95 >= 0.0020)
-    passes_safety = (d3c >= -0.0025) and (d95 >= -0.0030) and (cand.params_m <= 2.55)
+    rank_score = 0.35 * dv50 + 0.65 * dv95
+    passes_gain = (dv50 >= 0.0030) or (dv95 >= 0.0030)
+    passes_safety = (dv95 >= -0.0030) and (dv50 >= -0.0050) and (cand.params_m <= 2.55)
     is_promising = bool(passes_gain and passes_safety)
 
     detail = (
-        f"{cand.exp_name}: O2O={cand.test_map50*100:.2f}%({d50*100:+.2f}%) / "
-        f"m95={cand.test_map50_95*100:.2f}%({d95*100:+.2f}%) | "
-        f"3cls={c3*100:.2f}%({d3c*100:+.2f}%) | Rect={cand.rect_map50*100:.2f}%({drect*100:+.2f}%) | "
-        f"Δ_E2E={cand.delta_e2e_50*100:+.2f}% | rank={rank_score*100:+.3f} | PASS={is_promising}"
+        f"{cand.exp_name}: Val={_fmt_pct(cand.val_map50)}({_fmt_pct(dv50, True)}) / "
+        f"{_fmt_pct(cand.val_map50_95)}({_fmt_pct(dv95, True)}) | val_rank={rank_score*100:+.3f} | "
+        f"PASS={is_promising} [passive Test={_fmt_pct(cand.test_map50)}/{_fmt_pct(cand.test_map50_95)}, "
+        f"3cls={_fmt_pct(cand.test_main3)}, Δ_E2E={_fmt_pct(cand.delta_e2e_50, True)}]"
     )
     return is_promising, rank_score, detail
 
@@ -290,7 +375,7 @@ class _ReportJournal:
         if drive_dir is not None:
             self._paths.append(drive_dir / "logs" / "auto_phase3_report.md")
         self._lines: List[str] = [
-            "# Phase 3 Autonomous Overnight Run Report",
+            "# Phase 3 Autonomous Overnight Run Report (Val-Only Selection)",
             f"- Started: `{datetime.now().isoformat(timespec='seconds')}`",
             "",
         ]
@@ -326,6 +411,7 @@ def _default_subprocess_runner(
     smoke_test: bool,
     resume: bool,
     export_onnx: bool,
+    timeout_sec: Optional[float] = None,
 ) -> int:
     cmd = [
         sys.executable,
@@ -346,8 +432,8 @@ def _default_subprocess_runner(
         cmd.append("--no-resume")
     if export_onnx:
         cmd.append("--export-onnx")
-    print(f"\n[AUTO EXEC] {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd)
+    print(f"\n[AUTO EXEC] {' '.join(cmd)} (timeout={timeout_sec:.0f}s)" if timeout_sec else f"\n[AUTO EXEC] {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(cmd, timeout=timeout_sec)
     return int(proc.returncode)
 
 
@@ -364,8 +450,10 @@ def run_overnight_orchestrator(
     runner_fn: Optional[Callable[..., int]] = None,
     metrics_loader: Optional[Callable[[str], Optional[RunMetrics]]] = None,
     teacher_exists_fn: Optional[Callable[[str], bool]] = None,
+    health_loader: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    purity_checker: Optional[Callable[[str], Tuple[bool, str]]] = None,
 ) -> Dict[str, Any]:
-    """Execute the full Phase 3 decision tree with strict smoke, anti-waste, and walltime guards."""
+    """Execute the full Phase 3 Val-only decision tree with fail-fast & hard walltime guards."""
     t0 = time.monotonic()
     journal = _ReportJournal(work_dir, drive_dir)
     exec_fn = runner_fn or _default_subprocess_runner
@@ -380,13 +468,29 @@ def run_overnight_orchestrator(
             return teacher_exists_fn(run_name)
         return teacher_weights_exist(run_name, work_dir=work_dir, drive_dir=drive_dir)
 
+    def _load_health(run_dir: str) -> Optional[Dict[str, Any]]:
+        if health_loader is not None:
+            return health_loader(run_dir)
+        return load_kd_health(run_dir, work_dir=work_dir, drive_dir=drive_dir)
+
+    def _check_purity(run_dir: str) -> Tuple[bool, str]:
+        if purity_checker is not None:
+            return purity_checker(run_dir)
+        return verify_exported_student_purity(run_dir, work_dir=work_dir, drive_dir=drive_dir)
+
     def _elapsed_h() -> float:
         return (time.monotonic() - t0) / 3600.0
+
+    def _remaining_sec() -> float:
+        return max(float(max_hours) * 3600.0 - (time.monotonic() - t0), 0.0)
 
     def _has_budget(need_hours: float) -> bool:
         return (_elapsed_h() + need_hours) <= float(max_hours)
 
-    def _run_and_load(exp_spec: str, *, smoke: bool = False, onnx: bool = False) -> Tuple[int, Optional[RunMetrics]]:
+    def _run_and_load(exp_spec: str, *, smoke: bool = False, onnx: bool = False) -> RunMetrics:
+        rem = _remaining_sec()
+        if rem < 120.0:
+            raise TimeoutError(f"Hard walltime budget exhausted before `{exp_spec}` ({_elapsed_h():.2f}h / {max_hours:.1f}h).")
         rc = exec_fn(
             exp_spec,
             dataset_root=dataset_root,
@@ -395,19 +499,22 @@ def run_overnight_orchestrator(
             smoke_test=smoke,
             resume=resume,
             export_onnx=onnx,
+            timeout_sec=rem,
         )
         run_dir = _resolved_run_dir_name(exp_spec, smoke_test=smoke)
-        m = _load(run_dir)
         if rc != 0:
-            journal.log(f"⚠️ Run `{exp_spec}` exited with code {rc}.")
-        elif m is not None:
-            journal.log(
-                f"✅ `{run_dir}`: Params={m.params_m:.4f}M | Test O2O=`{m.test_map50*100:.2f}% / {m.test_map50_95*100:.2f}%` "
-                f"| 3cls=`{m.test_main3*100:.2f}%` | Rect=`{m.rect_map50*100:.2f}%` | Δ_E2E=`{m.delta_e2e_50*100:+.2f}%`"
-            )
-        else:
-            journal.log(f"⚠️ `{run_dir}` finished (rc=0) but metrics file could not be loaded.")
-        return rc, m
+            journal.log(f"🛑 FATAL: Sub-experiment `{exp_spec}` failed with exit code {rc}!")
+            raise RuntimeError(f"Sub-experiment `{exp_spec}` exited with code {rc}.")
+        m = _load(run_dir)
+        if m is None or not m.is_finite():
+            journal.log(f"🛑 FATAL: `{run_dir}` exited 0 but required Val/Test metrics are missing or non-finite!")
+            raise RuntimeError(f"Missing or non-finite required metrics for `{run_dir}`.")
+        journal.log(
+            f"✅ `{run_dir}`: Params={m.params_m:.4f}M | Val=`{_fmt_pct(m.val_map50)} / {_fmt_pct(m.val_map50_95)}` "
+            f"| Test O2O=`{_fmt_pct(m.test_map50)} / {_fmt_pct(m.test_map50_95)}` "
+            f"| 3cls=`{_fmt_pct(m.test_main3)}` | Δ_E2E=`{_fmt_pct(m.delta_e2e_50, True)}`"
+        )
+        return m
 
     result_state: Dict[str, Any] = {
         "teacher": None,
@@ -418,9 +525,9 @@ def run_overnight_orchestrator(
     }
 
     # =========================================================================
-    # Gate 0: Automatic Best Teacher Selection (`teacher_yolo26s` vs `m`)
+    # Gate 0: Automatic Best Teacher Selection (STRICT Validation-Only)
     # =========================================================================
-    journal.section("Gate 0: Teacher Selection (`teacher_yolo26s` vs `teacher_yolo26m`)")
+    journal.section("Gate 0: Teacher Selection (`teacher_yolo26s` vs `teacher_yolo26m`, Val-Only)")
     if force_teacher in ("s", "m"):
         t_tag = force_teacher
         journal.log(f"Using forced teacher tag: `teacher_yolo26{t_tag}`")
@@ -436,7 +543,7 @@ def run_overnight_orchestrator(
         journal.log(reason)
     result_state["teacher"] = f"teacher_yolo26{t_tag}"
 
-    # Load baseline reference for seed=42 (Drive first, verified fallback otherwise)
+    # Load baseline reference for seed=42
     base_42 = _load("v33_e0_base")
     if base_42 is None:
         fb = _FALLBACK_BASE_METRICS[42]
@@ -444,8 +551,8 @@ def run_overnight_orchestrator(
             exp_name="v33_e0_base",
             params_m=2.5353,
             gflops=6.035,
-            val_map50=0.90641,
-            val_map50_95=0.60549,
+            val_map50=fb["val_mAP50"],
+            val_map50_95=fb["val_mAP50_95"],
             test_map50=fb["mAP50"],
             test_map50_95=fb["mAP50_95"],
             test_main3=fb["main3"],
@@ -454,32 +561,40 @@ def run_overnight_orchestrator(
             total_ms=2.45,
         )
     journal.log(
-        f"Locked Baseline `v33_e0_base` (s42): O2O=`{base_42.test_map50*100:.2f}% / {base_42.test_map50_95*100:.2f}%` "
-        f"| 3cls=`{base_42.test_main3*100:.2f}%` | Rect=`{base_42.rect_map50*100:.2f}%`"
+        f"Locked Baseline `v33_e0_base` (s42): Val=`{_fmt_pct(base_42.val_map50)} / {_fmt_pct(base_42.val_map50_95)}` "
+        f"[passive Test=`{_fmt_pct(base_42.test_map50)} / {_fmt_pct(base_42.test_map50_95)}`, 3cls=`{_fmt_pct(base_42.test_main3)}`]"
     )
 
     # =========================================================================
-    # Gate 1: Mandatory 2-Epoch Smoke Gate (+0 Params Leakage Assertion!)
+    # Gate 1: Mandatory 2-Epoch Smoke Gate (Formal Batch VRAM + Adapter Step + Purity Lock)
     # =========================================================================
-    journal.section("Gate 1: Mandatory 2-Epoch Smoke Safety Lock")
+    journal.section("Gate 1: Mandatory 2-Epoch Smoke Lock (Formal Batch + Adapter Update + Purity)")
     smoke_preset = f"p3_kd_full_{t_tag}"
-    rc_sm, m_sm = _run_and_load(smoke_preset, smoke=True, onnx=False)
-    result_state["executed"].append(f"{smoke_preset}_smoke")
-    if rc_sm != 0 or m_sm is None or not m_sm.is_finite():
-        journal.log("🛑 SMOKE GATE FAILED (non-zero exit or NaN metrics). Aborting to protect Colab CUs!")
-        result_state["scenario"] = "ABORT_SMOKE_FAILED"
-        raise RuntimeError(f"Phase 3 smoke gate failed for {smoke_preset} (rc={rc_sm}).")
+    smoke_dir = _resolved_run_dir_name(smoke_preset, smoke_test=True)
+    m_sm = _run_and_load(smoke_preset, smoke=True, onnx=False)
+    result_state["executed"].append(smoke_dir)
+
     if m_sm.params_m > 2.55:
-        journal.log(
-            f"🛑 ZERO-OVERHEAD VIOLATION: exported best.pt has {m_sm.params_m:.4f}M params (> 2.55M)! "
-            "Teacher or adapters leaked into checkpoint. Aborting immediately!"
-        )
+        journal.log(f"🛑 ZERO-OVERHEAD VIOLATION: exported best.pt has {m_sm.params_m:.4f}M params (> 2.55M)!")
         result_state["scenario"] = "ABORT_PARAM_LEAK"
         raise RuntimeError(f"Zero-overhead check failed: exported best.pt has {m_sm.params_m:.4f}M params.")
 
+    health = _load_health(smoke_dir)
+    if health is None or int(health.get("adapter_steps", 0)) < 1 or int(health.get("total_kd_batches", 0)) < 1:
+        journal.log(f"🛑 KD HEALTH CHECK FAILED: kd_health.json={health} (adapters did not step!).")
+        result_state["scenario"] = "ABORT_KD_INACTIVE"
+        raise RuntimeError(f"Gate 1 KD health check failed for `{smoke_dir}`: {health}")
+
+    pure_ok, pure_msg = _check_purity(smoke_dir)
+    if not pure_ok:
+        journal.log(f"🛑 CHECKPOINT PURITY VIOLATION: {pure_msg}")
+        result_state["scenario"] = "ABORT_PURITY_FAIL"
+        raise RuntimeError(f"Gate 1 checkpoint purity failed: {pure_msg}")
+
     result_state["smoke_passed"] = True
     journal.log(
-        f"🟢 SMOKE GATE PASSED! Exported best.pt strictly verified at `{m_sm.params_m:.4f}M params / {m_sm.gflops:.3f}G FLOPs` (+0.00ms)."
+        f"🟢 SMOKE GATE PASSED! {pure_msg} | adapter_steps={health.get('adapter_steps')}, "
+        f"kd_batches={health.get('total_kd_batches')}, peak_vram={health.get('peak_vram_gb', 0.0):.2f} GB"
     )
     if smoke_only:
         journal.log("`smoke_only=True` requested -> stopping cleanly after smoke verification.")
@@ -487,9 +602,9 @@ def run_overnight_orchestrator(
         return result_state
 
     # =========================================================================
-    # Gate 2: Core Probe Trio (seed=42) + Automatic 0.3x Gentle Rescue
+    # Gate 2: Core Probe Trio (`seed=42`, Val-Only Promotion) + 0.3x Gentle Rescue
     # =========================================================================
-    journal.section("Gate 2: Core KD Probes (`seed=42`) & Winner Selection")
+    journal.section("Gate 2: Core KD Probes (`seed=42`, Val-Only Winner Selection)")
     probe_specs = [
         f"p3_kd_full_{t_tag}",
         f"p3_kd_full_norun_{t_tag}",
@@ -500,28 +615,26 @@ def run_overnight_orchestrator(
         if not _has_budget(0.5):
             journal.log(f"⏱️ Walltime budget reached ({_elapsed_h():.2f}h / {max_hours:.1f}h) during Gate 2.")
             break
-        rc, m = _run_and_load(spec)
+        m = _run_and_load(spec)
         result_state["executed"].append(spec)
-        if rc == 0 and m is not None and m.is_finite():
-            ok, score, detail = evaluate_candidate_vs_base(m, base_42)
-            candidates[spec] = (ok, score, m)
-            journal.log(f"Probe eval -> {detail}")
+        ok, score, detail = evaluate_candidate_vs_base(m, base_42)
+        candidates[spec] = (ok, score, m)
+        journal.log(f"Probe eval -> {detail}")
 
     promising = [(score, spec, m) for spec, (ok, score, m) in candidates.items() if ok]
     if not promising and _has_budget(1.0):
         journal.log(
-            "🟡 None of default 1.0/0.5/1.0 probes cleared the anti-noise threshold -> "
+            "🟡 None of default 1.0/0.5/1.0 probes cleared Val promotion threshold -> "
             "Auto-triggering Gentle 0.3x Rescue (`p3_kd_gentle`) + Pure `M1 F-PKD` probe!"
         )
         for spec in (f"p3_kd_gentle_{t_tag}", f"p3_kd_m1_fpkd_{t_tag}"):
             if not _has_budget(0.5):
                 break
-            rc, m = _run_and_load(spec)
+            m = _run_and_load(spec)
             result_state["executed"].append(spec)
-            if rc == 0 and m is not None and m.is_finite():
-                ok, score, detail = evaluate_candidate_vs_base(m, base_42)
-                candidates[spec] = (ok, score, m)
-                journal.log(f"Rescue eval -> {detail}")
+            ok, score, detail = evaluate_candidate_vs_base(m, base_42)
+            candidates[spec] = (ok, score, m)
+            journal.log(f"Rescue eval -> {detail}")
         promising = [(score, spec, m) for spec, (ok, score, m) in candidates.items() if ok]
 
     # =========================================================================
@@ -530,10 +643,10 @@ def run_overnight_orchestrator(
     sota_queue = ["v33_sota_yolov8n", "v33_sota_yolov10n", "v33_sota_yolo11n", "v33_sota_yolo12n"]
 
     if not promising:
-        journal.section("Gate 3 -> Scenario C (Anti-Waste Brake Triggered)")
+        journal.section("Gate 3 -> Scenario C (Anti-Waste Brake Triggered on Val)")
         result_state["scenario"] = "SCENARIO_C_BRAKE"
         journal.log(
-            "🔴 No KD candidate cleared the strict anti-noise promotion gate on 2K HIT-UAV. "
+            "🔴 All completed KD candidates fell below the Val promotion threshold on 2K HIT-UAV. "
             "Braking multi-seed KD repeats to save Colab CUs; running ONLY the 4 SOTA baselines."
         )
         for spec in sota_queue:
@@ -554,7 +667,7 @@ def run_overnight_orchestrator(
     result_state["scenario"] = (
         "SCENARIO_B_RESCUED" if winner_spec in (f"p3_kd_gentle_{t_tag}", f"p3_kd_m1_fpkd_{t_tag}") else "SCENARIO_A_WIN"
     )
-    journal.section(f"Gate 3 -> {result_state['scenario']}! Winner Locked: `{winner_spec}` (rank={win_score*100:+.3f})")
+    journal.section(f"Gate 3 -> {result_state['scenario']}! Winner Locked by Val: `{winner_spec}` (val_rank={win_score*100:+.3f})")
 
     # Step 3.1: Complete remaining single-module ablations (seed=42)
     ablation_rest = [s for s in (f"p3_kd_m1_fpkd_{t_tag}", f"p3_kd_m3_qg_{t_tag}") if s not in candidates]
@@ -566,40 +679,58 @@ def run_overnight_orchestrator(
 
     # Step 3.2: Paired 3-Seed Truth Test (`seeds = 42, 0, 3407`)
     journal.section(f"Step 3.2: Paired 3-Seed Verification (`{winner_spec}` vs `v33_e0_base`)")
-    seed_pairs_50: Tuple[List[float], List[float]] = ([base_42.test_map50], [winner_m42.test_map50])
-    seed_pairs_95: Tuple[List[float], List[float]] = ([base_42.test_map50_95], [winner_m42.test_map50_95])
-    seed_pairs_3c: Tuple[List[float], List[float]] = ([base_42.test_main3], [winner_m42.test_main3])
+    val_pairs_50: Tuple[List[float], List[float]] = ([base_42.val_map50], [winner_m42.val_map50])
+    val_pairs_95: Tuple[List[float], List[float]] = ([base_42.val_map50_95], [winner_m42.val_map50_95])
+    test_pairs_50: Tuple[List[float], List[float]] = ([base_42.test_map50], [winner_m42.test_map50])
+    test_pairs_95: Tuple[List[float], List[float]] = ([base_42.test_map50_95], [winner_m42.test_map50_95])
+    test_pairs_3c: Tuple[List[float], List[float]] = ([base_42.test_main3], [winner_m42.test_main3])
 
     for sd in (0, 3407):
         if not _has_budget(0.55):
             break
         w_spec = f"{winner_spec}@s{sd}"
-        rc_w, m_w = _run_and_load(w_spec)
+        m_w = _run_and_load(w_spec)
         result_state["executed"].append(w_spec)
         m_b = _load(f"v33_e0_base_s{sd}")
         if m_b is None and sd in _FALLBACK_BASE_METRICS:
             fb = _FALLBACK_BASE_METRICS[sd]
             m_b = RunMetrics(
-                f"v33_e0_base_s{sd}", 2.5353, 6.035, 0.90, 0.59, fb["mAP50"], fb["mAP50_95"], fb["main3"], fb["rect50"], fb["delta_e2e_50"], 2.48
+                f"v33_e0_base_s{sd}",
+                2.5353,
+                6.035,
+                fb["val_mAP50"],
+                fb["val_mAP50_95"],
+                fb["mAP50"],
+                fb["mAP50_95"],
+                fb["main3"],
+                fb["rect50"],
+                fb["delta_e2e_50"],
+                2.48,
             )
-        if rc_w == 0 and m_w is not None and m_b is not None:
-            seed_pairs_50[0].append(m_b.test_map50)
-            seed_pairs_50[1].append(m_w.test_map50)
-            seed_pairs_95[0].append(m_b.test_map50_95)
-            seed_pairs_95[1].append(m_w.test_map50_95)
-            seed_pairs_3c[0].append(m_b.test_main3)
-            seed_pairs_3c[1].append(m_w.test_main3)
+        if m_b is not None:
+            val_pairs_50[0].append(m_b.val_map50)
+            val_pairs_50[1].append(m_w.val_map50)
+            val_pairs_95[0].append(m_b.val_map50_95)
+            val_pairs_95[1].append(m_w.val_map50_95)
+            test_pairs_50[0].append(m_b.test_map50)
+            test_pairs_50[1].append(m_w.test_map50)
+            test_pairs_95[0].append(m_b.test_map50_95)
+            test_pairs_95[1].append(m_w.test_map50_95)
+            if math.isfinite(m_b.test_main3) and math.isfinite(m_w.test_main3):
+                test_pairs_3c[0].append(m_b.test_main3)
+                test_pairs_3c[1].append(m_w.test_main3)
 
-    st50 = compute_paired_stats(*seed_pairs_50)
-    st95 = compute_paired_stats(*seed_pairs_95)
-    st3c = compute_paired_stats(*seed_pairs_3c)
+    sv50 = compute_paired_stats(*val_pairs_50)
+    sv95 = compute_paired_stats(*val_pairs_95)
+    st50 = compute_paired_stats(*test_pairs_50)
+    st95 = compute_paired_stats(*test_pairs_95)
+    st3c = compute_paired_stats(*test_pairs_3c)
     journal.log(
-        f"📊 3-Seed Paired Stats (n={int(st50['n'])}): "
-        f"mAP50 `{st50['base_mean']*100:.2f}±{st50['base_std']*100:.2f}% -> {st50['cand_mean']*100:.2f}±{st50['cand_std']*100:.2f}%` "
-        f"(`Δ={st50['delta_mean']*100:+.2f}%, t={st50['t_stat']:+.2f}`) | "
-        f"mAP50-95 `{st95['base_mean']*100:.2f}% -> {st95['cand_mean']*100:.2f}%` "
-        f"(`Δ={st95['delta_mean']*100:+.2f}%, t={st95['t_stat']:+.2f}`) | "
-        f"3cls `Δ={st3c['delta_mean']*100:+.2f}%`"
+        f"📊 3-Seed Paired Stats (n={int(sv50['n'])}): "
+        f"Val Δ50=`{_fmt_pct(sv50['delta_mean'], True)}` / Δ95=`{_fmt_pct(sv95['delta_mean'], True)}` | "
+        f"[Passive Test] mAP50 `{st50['base_mean']*100:.2f}±{st50['base_std']*100:.2f}% -> {st50['cand_mean']*100:.2f}±{st50['cand_std']*100:.2f}%` "
+        f"(`Δ={st50['delta_mean']*100:+.2f}%, t={st50['t_stat']:+.2f}`), "
+        f"mAP50-95 `Δ={st95['delta_mean']*100:+.2f}% (t={st95['t_stat']:+.2f})`, 3cls `Δ={_fmt_pct(st3c['delta_mean'], True)}`"
     )
 
     # Step 3.3: Fair 2026 Literature KD Baselines (`seed=42`)
@@ -620,9 +751,9 @@ def run_overnight_orchestrator(
         _run_and_load(spec)
         result_state["executed"].append(spec)
 
-    # Step 3.5: Bonus 5-Seed Upgrade (`seeds=2025, 2026`) ONLY if 3-seed paired gain held cleanly!
-    three_seed_solid = (st50["n"] >= 3) and ((st50["delta_mean"] >= 0.0040) or (st95["delta_mean"] >= 0.0030))
-    if three_seed_solid and _has_budget(1.6):
+    # Step 3.5: Bonus 5-Seed Upgrade (`seeds=2025, 2026`) gated STRICTLY on 3-Seed Val gain + time budget!
+    three_seed_val_solid = (sv50["n"] >= 3) and ((sv50["delta_mean"] >= 0.0025) or (sv95["delta_mean"] >= 0.0025))
+    if three_seed_val_solid and _has_budget(1.6):
         journal.section("Step 3.5: Bonus 5-Seed Paired Upgrade (`seeds=2025, 2026`)")
         for sd in (2025, 2026):
             if not _has_budget(0.95):
@@ -630,21 +761,22 @@ def run_overnight_orchestrator(
                 break
             b_spec = f"v33_e0_base@s{sd}"
             w_spec = f"{winner_spec}@s{sd}"
-            rc_b, m_b = _run_and_load(b_spec)
+            m_b = _run_and_load(b_spec)
             result_state["executed"].append(b_spec)
-            rc_w, m_w = _run_and_load(w_spec, onnx=(export_onnx and sd == 2026))
+            m_w = _run_and_load(w_spec, onnx=(export_onnx and sd == 2026))
             result_state["executed"].append(w_spec)
-            if rc_b == 0 and rc_w == 0 and m_b is not None and m_w is not None:
-                seed_pairs_50[0].append(m_b.test_map50)
-                seed_pairs_50[1].append(m_w.test_map50)
-                seed_pairs_95[0].append(m_b.test_map50_95)
-                seed_pairs_95[1].append(m_w.test_map50_95)
-                seed_pairs_3c[0].append(m_b.test_main3)
-                seed_pairs_3c[1].append(m_w.test_main3)
-        st50_f = compute_paired_stats(*seed_pairs_50)
-        st95_f = compute_paired_stats(*seed_pairs_95)
+            val_pairs_50[0].append(m_b.val_map50)
+            val_pairs_50[1].append(m_w.val_map50)
+            val_pairs_95[0].append(m_b.val_map50_95)
+            val_pairs_95[1].append(m_w.val_map50_95)
+            test_pairs_50[0].append(m_b.test_map50)
+            test_pairs_50[1].append(m_w.test_map50)
+            test_pairs_95[0].append(m_b.test_map50_95)
+            test_pairs_95[1].append(m_w.test_map50_95)
+        st50_f = compute_paired_stats(*test_pairs_50)
+        st95_f = compute_paired_stats(*test_pairs_95)
         journal.log(
-            f"🏆 Final {int(st50_f['n'])}-Seed Paired Stats: "
+            f"🏆 Final {int(st50_f['n'])}-Seed Passive Test Paired Stats: "
             f"mAP50 `{st50_f['base_mean']*100:.2f}±{st50_f['base_std']*100:.2f}% -> {st50_f['cand_mean']*100:.2f}±{st50_f['cand_std']*100:.2f}%` "
             f"(`Δ={st50_f['delta_mean']*100:+.2f}%, t={st50_f['t_stat']:+.2f}`) | "
             f"mAP50-95 `{st95_f['base_mean']*100:.2f}% -> {st95_f['cand_mean']*100:.2f}%` "
@@ -652,7 +784,7 @@ def run_overnight_orchestrator(
         )
     else:
         journal.log(
-            f"Skipping 5-seed extension (three_seed_solid={three_seed_solid}, elapsed={_elapsed_h():.2f}h / {max_hours:.1f}h)."
+            f"Skipping 5-seed extension (three_seed_val_solid={three_seed_val_solid}, elapsed={_elapsed_h():.2f}h / {max_hours:.1f}h)."
         )
 
     journal.log(f"🎉 Autonomous Phase 3 overnight orchestration completed cleanly in {_elapsed_h():.2f}h!")
@@ -664,7 +796,7 @@ def main() -> None:
     parser.add_argument("--dataset-root", type=Path, default=Path("/content/datasets"))
     parser.add_argument("--work-dir", type=Path, default=Path("/content/work"))
     parser.add_argument("--drive-dir", type=Path, default=None)
-    parser.add_argument("--max-hours", type=float, default=8.5, help="Wall-clock budget before graceful stop.")
+    parser.add_argument("--max-hours", type=float, default=8.5, help="Hard wall-clock budget before graceful stop.")
     parser.add_argument("--force-teacher", type=str, choices=["s", "m"], default=None)
     parser.add_argument("--smoke-only", action="store_true", help="Stop right after Gate 1 smoke test.")
     parser.add_argument("--no-resume", action="store_true")

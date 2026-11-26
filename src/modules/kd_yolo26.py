@@ -35,6 +35,7 @@ Advantage Gate, and `3x3` AvgPool Low-Frequency Structural Alignment) for partia
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -330,19 +331,19 @@ def compute_soft_bce_kd(
     teacher_logits: torch.Tensor,
     *,
     tau: float = 2.0,
-    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Temperature-smoothed per-anchor binary KL divergence (mean over classes), strictly in FP32.
 
-    Subtracting teacher binary entropy makes the loss exact `0.0` at `z_s == z_t` with identical
-    gradients to soft BCE, and averaging over classes keeps scale invariant across 4/5/80-class tasks.
+    Subtracts detached teacher self-BCE (`BCE(z_t/T, sigmoid(z_t/T))`) without clamping the
+    differentiable tensor so gradients match exact soft BCE everywhere (zero cutoff at extreme logits)
+    while remaining exact `0.0` at `z_s == z_t` and scale-invariant across 4/5/80-class tasks.
     """
     t = float(max(tau, 1e-3))
     zs = student_logits.float() / t
-    pt = (teacher_logits.detach().float() / t).sigmoid()
-    pt_safe = pt.clamp(min=eps, max=1.0 - eps)
-    h_pt = -(pt_safe * pt_safe.log() + (1.0 - pt_safe) * (1.0 - pt_safe).log())
-    kl = (F.binary_cross_entropy_with_logits(zs, pt, reduction="none") - h_pt).clamp(min=0.0)
+    zt = teacher_logits.detach().float() / t
+    pt = zt.sigmoid()
+    h_pt = F.binary_cross_entropy_with_logits(zt, pt, reduction="none").detach()
+    kl = F.binary_cross_entropy_with_logits(zs, pt, reduction="none") - h_pt
     return kl.mean(dim=-1) * (t * t)
 
 
@@ -464,6 +465,8 @@ def compute_dual_teacher_advantage_gate(
 def _infer_detect_in_channels(model: nn.Module) -> List[int]:
     """Infer exact `[P3, P4, P5, ...]` input channel counts from `Detect.cv2`."""
     detect = model.model[-1] if hasattr(model, "model") else model[-1]
+    if getattr(detect, "cv2", None) is None:
+        raise TypeError("Detect head is missing `cv2` (stripped O2M branch is incompatible with dual-head KD).")
     channels: List[int] = []
     for branch in detect.cv2:
         first = branch[0]
@@ -474,6 +477,39 @@ def _infer_detect_in_channels(model: nn.Module) -> List[int]:
         else:
             raise RuntimeError(f"Cannot infer Detect input channels from {type(first)}")
     return channels
+
+
+def validate_teacher_compatibility(student_model: nn.Module, teacher_model: nn.Module) -> None:
+    """Pre-flight check ensuring teacher has intact dual-head (O2M + O2O), matching nc/stride/reg_max."""
+    s_det = student_model.model[-1] if hasattr(student_model, "model") else student_model[-1]
+    t_det = teacher_model.model[-1] if hasattr(teacher_model, "model") else teacher_model[-1]
+
+    for attr in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+        branch = getattr(t_det, attr, None)
+        if branch is None or not isinstance(branch, nn.ModuleList) or len(branch) == 0:
+            raise TypeError(
+                f"Incompatible KD teacher: Detect.{attr} is missing or stripped! "
+                "Use an unstripped dual-head YOLO26 checkpoint (regular trained best.pt)."
+            )
+    if int(getattr(t_det, "nc", -1)) != int(getattr(s_det, "nc", -2)):
+        raise ValueError(f"KD teacher nc mismatch: teacher={getattr(t_det, 'nc', None)} vs student={getattr(s_det, 'nc', None)}")
+    if int(getattr(t_det, "reg_max", -1)) != int(getattr(s_det, "reg_max", -2)):
+        raise ValueError(
+            f"KD teacher reg_max mismatch: teacher={getattr(t_det, 'reg_max', None)} vs student={getattr(s_det, 'reg_max', None)}"
+        )
+    if int(getattr(t_det, "nl", -1)) != int(getattr(s_det, "nl", -2)):
+        raise ValueError(f"KD teacher scale count mismatch: teacher={getattr(t_det, 'nl', None)} vs student={getattr(s_det, 'nl', None)}")
+
+    s_stride = [float(x) for x in s_det.stride.tolist()]
+    t_stride = [float(x) for x in t_det.stride.tolist()]
+    if s_stride != t_stride:
+        raise ValueError(f"KD teacher stride mismatch: teacher={t_stride} vs student={s_stride}")
+
+    s_names = getattr(student_model, "names", None)
+    t_names = getattr(teacher_model, "names", None)
+    if isinstance(s_names, dict) and isinstance(t_names, dict) and s_names and t_names:
+        if [s_names.get(i) for i in range(int(s_det.nc))] != [t_names.get(i) for i in range(int(t_det.nc))]:
+            raise ValueError(f"KD teacher class name order mismatch: teacher={t_names} vs student={s_names}")
 
 
 def load_frozen_teacher(
@@ -599,7 +635,7 @@ class YOLO26DistillCriterion:
         adapters: NeckChannelAdapters,
         cfg: YOLO26KDConfig,
         *,
-        student_hook: Optional[_FeatureCaptureHook] = None,
+        expected_s_channels: Sequence[int],
         teacher_hook: Optional[_FeatureCaptureHook] = None,
     ) -> None:
         self._base = base_criterion
@@ -607,11 +643,33 @@ class YOLO26DistillCriterion:
         self._teacher_model = teacher_model
         self._adapters = adapters
         self._kd_cfg = cfg
-        self._student_hook = student_hook
+        self._expected_s_channels = [int(c) for c in expected_s_channels]
         self._teacher_hook = teacher_hook
         self._kd_epoch = 0
         self._kd_total_epochs = int(max(getattr(base_criterion.one2one.hyp, "epochs", 100), 1))
-        self._last_kd_stats: Dict[str, float] = {}
+        self._verified_feats = False
+        self._epoch_kd_sum: Optional[torch.Tensor] = None
+        self._epoch_kd_count: int = 0
+        self._total_kd_batches: int = 0
+        self._last_r_t: float = 0.0
+        self._last_epoch_avg_kd: Dict[str, float] = {}
+
+    def flush_epoch_kd_stats(self) -> Dict[str, float]:
+        """Convert device-accumulated KD losses to host floats ONCE per epoch (zero per-batch sync)."""
+        if self._epoch_kd_sum is None or self._epoch_kd_count == 0:
+            return {}
+        avg = (self._epoch_kd_sum / float(self._epoch_kd_count)).detach().cpu().tolist()
+        stats = {
+            "r_t": float(self._last_r_t),
+            "m1": float(avg[0]),
+            "m2": float(avg[1]),
+            "m3": float(avg[2]),
+            "batches": int(self._epoch_kd_count),
+        }
+        self._epoch_kd_sum.zero_()
+        self._epoch_kd_count = 0
+        self._last_epoch_avg_kd = stats
+        return stats
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> None:
         # Never deep-copy frozen teacher or adapters when Ultralytics snapshots `trainer.model`
@@ -962,8 +1020,7 @@ class YOLO26DistillCriterion:
         preds: Any,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # Always clear captured feature buffers cleanly even if validation or error occurs
-        s_feats = self._student_hook.pop() if self._student_hook is not None else None
+        # Always clear teacher capture buffer cleanly even if validation or error occurs
         if self._teacher_hook is not None:
             self._teacher_hook.pop()
 
@@ -995,12 +1052,21 @@ class YOLO26DistillCriterion:
             decay_frac=cfg.kd_decay_frac,
             final_scale=cfg.kd_final_scale,
         )
+        self._last_r_t = float(r_t)
         if r_t <= 1e-6 or "img" not in batch:
             return base_total, loss_o2o_detach
 
-        # Fallback to `s_o2m["feats"]` if pre-hook did not fire (e.g. direct criterion unit test)
-        if s_feats is None:
-            s_feats = s_o2m["feats"]
+        # Directly consume un-detached Neck features `s_o2m["feats"]` (zero forward hook on student!)
+        s_feats = s_o2m["feats"]
+        if not self._verified_feats:
+            got_ch = [int(f.shape[1]) for f in s_feats]
+            if got_ch != self._expected_s_channels:
+                raise RuntimeError(
+                    f"Student `one2many['feats']` channel mismatch: got {got_ch}, expected {self._expected_s_channels}."
+                )
+            if not any(f.requires_grad for f in s_feats):
+                raise RuntimeError("Student `one2many['feats']` is detached; Backbone/Neck KD gradients would be blocked.")
+            self._verified_feats = True
 
         # 3. Frozen teacher forward on identical batch["img"] (zero host-device sync)
         raw_img = batch["img"]
@@ -1082,24 +1148,23 @@ class YOLO26DistillCriterion:
             l_m3 = self._compute_m3_qg_head(s_o2m, s_o2o, s_o2o_fg, t_assign, anchor_points, stride_tensor)
 
         # Combine into Ultralytics 3-slot loss tensor `[box, cls, l1]` * batch_size
-        # Finite guard prevents any unforeseen batch glitch from poisoning EMA weights
+        # Strict fail-fast on non-finite KD losses (NEVER silently degrade into pure-detection training!)
         kd_m1_s = r_t * float(cfg.lambda_feat) * l_m1
         kd_m2_s = r_t * float(cfg.lambda_cross) * l_m2
         kd_m3_s = r_t * float(cfg.lambda_head) * l_m3
-        kd_sum = kd_m1_s + kd_m2_s + kd_m3_s
+        parts = torch.stack((kd_m3_s, kd_m2_s, kd_m1_s))
+        if not torch.isfinite(parts).all():
+            raise FloatingPointError(
+                f"Non-finite KD loss at epoch={self._kd_epoch}: [M3,M2,M1]={parts.detach().cpu().tolist()}"
+            )
+        total_loss = base_total + parts.to(base_total.dtype) * bs
 
-        if torch.isfinite(kd_sum):
-            kd_vec = torch.stack([kd_m3_s, kd_m2_s, kd_m1_s]).to(base_total.dtype) * bs
-            total_loss = base_total + kd_vec
-        else:
-            total_loss = base_total
-
-        self._last_kd_stats = {
-            "r_t": float(r_t),
-            "m1": float(l_m1.detach().item()),
-            "m2": float(l_m2.detach().item()),
-            "m3": float(l_m3.detach().item()),
-        }
+        # Device-side epoch accumulator (zero per-batch GPU->CPU sync!)
+        if self._epoch_kd_sum is None:
+            self._epoch_kd_sum = torch.zeros(3, device=device, dtype=torch.float32)
+        self._epoch_kd_sum += torch.stack((l_m1.detach(), l_m2.detach(), l_m3.detach())).float()
+        self._epoch_kd_count += 1
+        self._total_kd_batches += 1
         return total_loss, loss_o2o_detach
 
 
@@ -1119,27 +1184,26 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         "adapters": None,
         "adapter_opt": None,
         "criterion": None,
+        "base_criterion": None,
+        "orig_opt_step": None,
         "handles": [],
+        "adapter_steps": 0,
+        "teacher_sig": "",
     }
 
     def _on_train_start(trainer: Any) -> None:
         raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
         device = next(raw_model.parameters()).device
 
-        teacher = load_frozen_teacher(cfg.teacher_weights, device, use_ema=cfg.use_ema_teacher)
+        teacher_path = Path(cfg.teacher_weights)
+        teacher = load_frozen_teacher(teacher_path, device, use_ema=cfg.use_ema_teacher)
+        validate_teacher_compatibility(raw_model, teacher)
+        teacher_sig = f"{teacher_path.name}:{teacher_path.stat().st_size}"
+        state["teacher_sig"] = teacher_sig
+
         s_ch = _infer_detect_in_channels(raw_model)
         t_ch = _infer_detect_in_channels(teacher)
         adapters = NeckChannelAdapters(s_ch, t_ch).to(device)
-
-        # Resume adapter weights if resuming an interrupted run
-        save_dir = Path(getattr(trainer, "save_dir", "."))
-        adapter_ckpt = save_dir / "weights" / "kd_adapters.pt"
-        if adapter_ckpt.is_file() and getattr(trainer.args, "resume", False):
-            try:
-                adapters.load_state_dict(torch.load(str(adapter_ckpt), map_location=device, weights_only=True))
-                print(f"[PHASE 3 KD] Restored adapter state from {adapter_ckpt}")
-            except Exception as exc:
-                print(f"[WARN] Could not restore KD adapters ({exc}); starting fresh.")
 
         # Dedicated AdamW for adapters: completely isolated from `MuSGD` Newton-Schulz & `LambdaLR`
         base_lr = float(trainer.optimizer.param_groups[0]["lr"])
@@ -1149,27 +1213,46 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
             weight_decay=float(cfg.adapter_weight_decay),
         )
 
-        # Pickle-safe module-level pre-hooks on Detect capture exact un-detached Neck features [P3, P4, P5]
-        s_hook = _FeatureCaptureHook(detach=False)
+        # Restore BOTH adapters and adapter_opt from `kd_state.pt` when resuming an interrupted run
+        save_dir = Path(getattr(trainer, "save_dir", "."))
+        kd_state_ckpt = save_dir / "weights" / "kd_state.pt"
+        if getattr(trainer.args, "resume", False) and kd_state_ckpt.is_file():
+            try:
+                kd_st = torch.load(str(kd_state_ckpt), map_location=device, weights_only=False)
+                saved_sig = kd_st.get("teacher_sig", "")
+                if saved_sig and saved_sig != teacher_sig:
+                    raise ValueError(f"Teacher mismatch on resume: saved={saved_sig} vs current={teacher_sig}")
+                adapters.load_state_dict(kd_st["adapters"])
+                if "adapter_opt" in kd_st:
+                    adapter_opt.load_state_dict(kd_st["adapter_opt"])
+                print(
+                    f"[PHASE 3 KD] Restored adapters + AdamW moments from {kd_state_ckpt} "
+                    f"(saved_epoch={kd_st.get('epoch')})"
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed restoring KD resume state from {kd_state_ckpt}: {exc}") from exc
+
+        # Pre-hook ONLY on frozen teacher (ZERO hooks attached to student_model -> immune to NaN EMA rebuild!)
         t_hook = _FeatureCaptureHook(detach=True)
-        h_s = raw_model.model[-1].register_forward_pre_hook(s_hook)
         h_t = teacher.model[-1].register_forward_pre_hook(t_hook)
-        state["handles"] = [h_s, h_t]
+        state["handles"] = [h_t]
         state["teacher"] = teacher
         state["adapters"] = adapters
         state["adapter_opt"] = adapter_opt
 
-        # Initialize native criterion eagerly & replace with deepcopy-safe KD wrapper (no closure on `raw_model`!)
+        # Initialize native criterion eagerly & replace with deepcopy-safe KD wrapper
         base_crit = getattr(raw_model, "criterion", None)
         if base_crit is None:
             base_crit = raw_model.init_criterion()
+        state["base_criterion"] = base_crit
+
         kd_crit = YOLO26DistillCriterion(
             base_crit,
             raw_model,
             teacher,
             adapters,
             cfg,
-            student_hook=s_hook,
+            expected_s_channels=s_ch,
             teacher_hook=t_hook,
         )
         kd_crit._kd_total_epochs = int(max(getattr(trainer, "epochs", 100), 1))
@@ -1179,6 +1262,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
 
         # Wrap trainer.optimizer_step so adapters track exact per-step LR (incl. warmup) & step under GradScaler
         orig_opt_step = trainer.optimizer_step
+        state["orig_opt_step"] = orig_opt_step
 
         def _wrapped_optimizer_step() -> None:
             has_grad = any(p.grad is not None for p in adapters.parameters())
@@ -1195,6 +1279,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
                 else:
                     torch.nn.utils.clip_grad_norm_(adapters.parameters(), max_norm=10.0)
                     adapter_opt.step()
+                state["adapter_steps"] += 1
                 adapter_opt.zero_grad(set_to_none=True)
             orig_opt_step()
 
@@ -1202,7 +1287,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
 
         n_adapt_params = sum(p.numel() for p in adapters.parameters())
         print(
-            f"[PHASE 3 KD] Attached zero-latency YOLO26 KD | teacher={Path(cfg.teacher_weights).name} "
+            f"[PHASE 3 KD] Attached zero-latency YOLO26 KD | teacher={teacher_path.name} "
             f"| ch: {s_ch} -> {t_ch} (adapters={n_adapt_params:,} train-only params, +0 inference params) "
             f"| M1={cfg.use_m1_feat}:{cfg.feat_kd_mode}(w={cfg.lambda_feat}) "
             f"| M2_CrossO2O={cfg.use_m2_cross_o2o}(w={cfg.lambda_cross}, sup={cfg.cross_sup_weight}) "
@@ -1214,7 +1299,6 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         if crit is not None:
             crit._kd_epoch = int(getattr(trainer, "epoch", 0))
             crit._kd_total_epochs = int(max(getattr(trainer, "epochs", 100), 1))
-        # Sync adapter LR with main optimizer schedule
         adapter_opt = state.get("adapter_opt")
         if adapter_opt is not None and getattr(trainer, "optimizer", None) is not None:
             cur_lr = float(trainer.optimizer.param_groups[0]["lr"]) * float(cfg.adapter_lr_mult)
@@ -1224,29 +1308,82 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
     def _on_fit_epoch_end(trainer: Any) -> None:
         crit = state.get("criterion")
         epoch_idx = int(getattr(trainer, "epoch", 0)) + 1
-        if crit is not None and crit._last_kd_stats and (epoch_idx <= 2 or epoch_idx % 10 == 0):
-            st = crit._last_kd_stats
-            print(
-                f"[PHASE 3 KD][Ep {epoch_idx}] r(t)={st['r_t']:.2f} | "
-                f"M1={st['m1']:.4f} | M2={st['m2']:.4f} | M3={st['m3']:.4f}"
-            )
-        # Save lightweight adapter checkpoint for clean resume without touching `best.pt`/`last.pt`
+        if crit is not None:
+            st = crit.flush_epoch_kd_stats()
+            if st and (epoch_idx <= 2 or epoch_idx % 10 == 0):
+                print(
+                    f"[PHASE 3 KD][Ep {epoch_idx}] r(t)={st['r_t']:.2f} | "
+                    f"M1={st['m1']:.4f} | M2={st['m2']:.4f} | M3={st['m3']:.4f} "
+                    f"(batches={st['batches']}, adapter_steps={state['adapter_steps']})"
+                )
+        # Save exact-epoch `kd_state.pt` (~0.8MB, <5ms) alongside `last.pt` for lossless resume
         adapters = state.get("adapters")
-        if adapters is not None and (epoch_idx % 25 == 0):
+        adapter_opt = state.get("adapter_opt")
+        if adapters is not None and adapter_opt is not None:
             try:
                 w_dir = Path(trainer.save_dir) / "weights"
                 w_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(adapters.state_dict(), str(w_dir / "kd_adapters.pt"))
-            except Exception:
-                pass
+                torch.save(
+                    {
+                        "epoch": epoch_idx,
+                        "teacher_sig": state["teacher_sig"],
+                        "adapters": adapters.state_dict(),
+                        "adapter_opt": adapter_opt.state_dict(),
+                    },
+                    str(w_dir / "kd_state.pt"),
+                )
+            except Exception as exc:
+                print(f"[WARN] Could not save kd_state.pt at epoch {epoch_idx}: {exc}")
 
     def _on_train_end(trainer: Any) -> None:
+        raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        crit = state.get("criterion")
+        peak_vram_gb = 0.0
+        if torch.cuda.is_available():
+            try:
+                peak_vram_gb = round(float(torch.cuda.max_memory_allocated()) / (1024.0 ** 3), 3)
+            except Exception:
+                peak_vram_gb = 0.0
+
+        # Persist KD health diagnostics for Gate 1 verification
+        try:
+            health = {
+                "teacher_sig": state.get("teacher_sig", ""),
+                "adapter_steps": int(state.get("adapter_steps", 0)),
+                "total_kd_batches": int(getattr(crit, "_total_kd_batches", 0)) if crit is not None else 0,
+                "last_epoch_avg_kd": getattr(crit, "_last_epoch_avg_kd", {}) if crit is not None else {},
+                "peak_vram_gb": peak_vram_gb,
+                "needs_adapters": bool((cfg.use_m1_feat and cfg.feat_kd_mode != "none") or cfg.use_m2_cross_o2o),
+            }
+            out_p = Path(trainer.save_dir) / "kd_health.json"
+            out_p.write_text(json.dumps(health, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(
+                f"[PHASE 3 KD] Health summary -> adapter_steps={health['adapter_steps']}, "
+                f"kd_batches={health['total_kd_batches']}, peak_vram={peak_vram_gb:.2f} GB"
+            )
+        except Exception as exc:
+            print(f"[WARN] Could not write kd_health.json: {exc}")
+
+        # Clean teardown: restore native criterion & optimizer_step, release teacher/adapters VRAM
+        if state.get("base_criterion") is not None:
+            raw_model.criterion = state["base_criterion"]
+        if state.get("orig_opt_step") is not None:
+            trainer.optimizer_step = state["orig_opt_step"]
         for h in state.get("handles", []):
             try:
                 h.remove()
             except Exception:
                 pass
         state["handles"] = []
+        state["teacher"] = None
+        state["adapters"] = None
+        state["adapter_opt"] = None
+        state["criterion"] = None
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     yolo_model.add_callback("on_train_start", _on_train_start)
     yolo_model.add_callback("on_train_epoch_start", _on_train_epoch_start)

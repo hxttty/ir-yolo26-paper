@@ -73,10 +73,10 @@ def _sync_tree(src: Path, dst: Path) -> None:
 
 
 def _sync_weights_and_csv(local_run_dir: Path, drive_run_dir: Path) -> None:
-    """Fast lightweight sync called periodically during training."""
+    """Fast lightweight sync called periodically during training (includes KD adapter/opt state)."""
     drive_weights = drive_run_dir / "weights"
     drive_weights.mkdir(parents=True, exist_ok=True)
-    for fname in ("last.pt", "best.pt"):
+    for fname in ("last.pt", "best.pt", "kd_state.pt"):
         src_f = local_run_dir / "weights" / fname
         if src_f.exists():
             shutil.copy2(src_f, drive_weights / fname)
@@ -118,24 +118,45 @@ def run_experiment(
         print(f"[SKIP] Found {drive_run_dir / '_COMPLETED.flag'}. Delete it on Drive if you want to re-run.")
         return drive_run_dir
 
-    # Check if we should resume from Drive checkpoint
+    # Check if we should resume from Drive checkpoint (or jump straight to eval if training already finished!)
     resume_ckpt: Optional[Path] = None
+    skip_train_eval_only: bool = False
     if cfg.resume and not cfg.smoke_test:
         candidates = [local_run_dir / "weights" / "last.pt"]
         if drive_run_dir is not None:
             candidates.append(drive_run_dir / "weights" / "last.pt")
         for cand in candidates:
             if cand.is_file():
-                # Copy Drive checkpoint to local SSD before resuming
-                if drive_run_dir is not None and cand.is_relative_to(drive_run_dir):
+                # Copy last.pt + historical best.pt + kd_state.pt from Drive -> local SSD together!
+                if drive_run_dir is not None and cand.is_relative_to(drive_dir):
                     local_weights = local_run_dir / "weights"
                     local_weights.mkdir(parents=True, exist_ok=True)
-                    dst_last = local_weights / "last.pt"
-                    shutil.copy2(cand, dst_last)
-                    resume_ckpt = dst_last
+                    for fname in ("last.pt", "best.pt", "kd_state.pt"):
+                        src_f = drive_run_dir / "weights" / fname
+                        if src_f.is_file():
+                            shutil.copy2(src_f, local_weights / fname)
+                    resume_ckpt = local_weights / "last.pt"
                 else:
                     resume_ckpt = cand
-                print(f"[RESUME] Resuming interrupted run from: {resume_ckpt}")
+                # Peek at Ultralytics checkpoint metadata: epoch == -1 means training finished & optimizer stripped!
+                try:
+                    import torch
+
+                    meta = torch.load(str(resume_ckpt), map_location="cpu", weights_only=False)
+                    ckpt_epoch = meta.get("epoch", 0) if isinstance(meta, dict) else 0
+                    has_opt = bool(isinstance(meta, dict) and meta.get("optimizer") is not None)
+                    if ckpt_epoch == -1 or not has_opt:
+                        best_cand = local_run_dir / "weights" / "best.pt"
+                        if best_cand.is_file():
+                            skip_train_eval_only = True
+                            print(
+                                f"[RESUME] Detected completed training checkpoint (epoch={ckpt_epoch}, "
+                                f"optimizer={has_opt}); skipping re-train and running post-eval + Drive archive!"
+                            )
+                except Exception as exc:
+                    print(f"[WARN] Could not inspect resume checkpoint metadata ({exc}); proceeding normally.")
+                if not skip_train_eval_only:
+                    print(f"[RESUME] Resuming interrupted run from: {resume_ckpt}")
                 break
 
     from src.modules import attach_phase1_callbacks, build_model_with_switches
@@ -171,66 +192,69 @@ def run_experiment(
         cfg.kd_teacher_weights = str(resolved_teacher)
         print(f"[PHASE 3 KD] Resolved frozen teacher checkpoint: {resolved_teacher}")
 
-    if resume_ckpt is not None:
-        from ultralytics import YOLO
-
-        model = YOLO(str(resume_ckpt))
-        # Re-attach training-only hooks (e.g. Mod C1/C2 NWD criterion patch) on resume!
-        attach_phase1_callbacks(model, cfg)
+    if skip_train_eval_only:
+        train_minutes = 0.0
     else:
-        model = build_model_with_switches(cfg, repo_root=repo_root)
+        if resume_ckpt is not None:
+            from ultralytics import YOLO
 
-    # Register periodic Drive sync callback so disconnects lose minimal epochs
-    if drive_run_dir is not None and cfg.save_period > 0:
-        def _on_fit_epoch_end(trainer) -> None:
-            epoch_idx = getattr(trainer, "epoch", 0) + 1
-            if epoch_idx % cfg.save_period == 0:
-                try:
-                    _sync_weights_and_csv(Path(trainer.save_dir), drive_run_dir)
-                    print(f"[DRIVE SYNC] Backed up epoch {epoch_idx} checkpoints -> {drive_run_dir}")
-                except Exception as exc:
-                    print(f"[WARN] Periodic Drive sync failed at epoch {epoch_idx}: {exc}")
+            model = YOLO(str(resume_ckpt))
+            # Re-attach training-only hooks (e.g. Phase 3 KD / V3 ODCS) on resume!
+            attach_phase1_callbacks(model, cfg)
+        else:
+            model = build_model_with_switches(cfg, repo_root=repo_root)
 
-        model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
+        # Register periodic Drive sync callback so disconnects lose minimal epochs
+        if drive_run_dir is not None and cfg.save_period > 0:
+            def _on_fit_epoch_end(trainer) -> None:
+                epoch_idx = getattr(trainer, "epoch", 0) + 1
+                if epoch_idx % cfg.save_period == 0:
+                    try:
+                        _sync_weights_and_csv(Path(trainer.save_dir), drive_run_dir)
+                        print(f"[DRIVE SYNC] Backed up epoch {epoch_idx} checkpoints -> {drive_run_dir}")
+                    except Exception as exc:
+                        print(f"[WARN] Periodic Drive sync failed at epoch {epoch_idx}: {exc}")
 
-    t_start = time.perf_counter()
-    if resume_ckpt is not None:
-        model.train(resume=True)
-    else:
-        train_kwargs = {
-            "data": str(dataset_yaml),
-            "epochs": cfg.epochs,
-            "patience": cfg.patience,
-            "batch": cfg.batch,
-            "imgsz": cfg.imgsz,
-            "optimizer": cfg.optimizer,
-            "lr0": cfg.lr0,
-            "lrf": cfg.lrf,
-            "weight_decay": cfg.weight_decay,
-            "warmup_epochs": cfg.warmup_epochs,
-            "close_mosaic": cfg.close_mosaic,
-            "workers": cfg.workers,
-            "cache": cfg.cache,
-            "amp": cfg.amp,
-            "seed": cfg.seed,
-            "deterministic": cfg.deterministic,
-            "project": str(local_project),
-            "name": cfg.exp_name,
-            "exist_ok": True,
-            "save": True,
-            "save_period": -1,  # Keep disk clean; our callback backs up last.pt + best.pt to Drive
-            "plots": True,
-        }
-        # Apply optional IR-Clean augmentation overrides when explicitly specified in preset
-        for opt_key in ("hsv_h", "hsv_s", "hsv_v", "erasing"):
-            val = getattr(cfg, opt_key, None)
-            if val is not None:
-                train_kwargs[opt_key] = val
-        train_kwargs.update(cfg.extra_train_kwargs)
-        model.train(**train_kwargs)
+            model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
 
-    train_minutes = (time.perf_counter() - t_start) / 60.0
-    print(f"\n[DONE] Training finished in {train_minutes:.2f} minutes.")
+        t_start = time.perf_counter()
+        if resume_ckpt is not None:
+            model.train(resume=True)
+        else:
+            train_kwargs = {
+                "data": str(dataset_yaml),
+                "epochs": cfg.epochs,
+                "patience": cfg.patience,
+                "batch": cfg.batch,
+                "imgsz": cfg.imgsz,
+                "optimizer": cfg.optimizer,
+                "lr0": cfg.lr0,
+                "lrf": cfg.lrf,
+                "weight_decay": cfg.weight_decay,
+                "warmup_epochs": cfg.warmup_epochs,
+                "close_mosaic": cfg.close_mosaic,
+                "workers": cfg.workers,
+                "cache": cfg.cache,
+                "amp": cfg.amp,
+                "seed": cfg.seed,
+                "deterministic": cfg.deterministic,
+                "project": str(local_project),
+                "name": cfg.exp_name,
+                "exist_ok": True,
+                "save": True,
+                "save_period": -1,  # Keep disk clean; our callback backs up last.pt + best.pt + kd_state.pt to Drive
+                "plots": True,
+            }
+            # Apply optional IR-Clean augmentation overrides when explicitly specified in preset
+            for opt_key in ("hsv_h", "hsv_s", "hsv_v", "erasing"):
+                val = getattr(cfg, opt_key, None)
+                if val is not None:
+                    train_kwargs[opt_key] = val
+            train_kwargs.update(cfg.extra_train_kwargs)
+            model.train(**train_kwargs)
+
+        train_minutes = (time.perf_counter() - t_start) / 60.0
+        print(f"\n[DONE] Training finished in {train_minutes:.2f} minutes.")
 
     # Save exact experiment config snapshot
     local_run_dir.mkdir(parents=True, exist_ok=True)

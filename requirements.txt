@@ -1,5 +1,5 @@
 # Core dependencies for Colab Pro (PyTorch & CUDA come pre-installed on Colab)
-ultralytics>=8.4.0
+ultralytics==8.4.219
 pyyaml>=6.0
 numpy>=1.24.0
 pandas>=2.0.0
