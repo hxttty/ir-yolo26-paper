@@ -113,6 +113,12 @@
       - **Test Rect (原生 640×512)**：**`88.81% / 59.3%`**（相对 `v33_e0_base` `85.97%` 暴涨 **`+2.83% mAP50`**！）；
       - **3 主类均分**：**`93.32%`**（`Person 93.58% / Car 96.22% / Bicycle 90.17%`，全 39 轮历史最高！`OtherVeh 72.08%`）；
       - **关键机制实证**：`Δ_E2E = -0.80% / -0.06%`（`O2O 88.01%` 反超 `O2M+NMS 87.21%`！验证“强骨干容量彻底消除甚至逆转端到端鸿沟”，为 `M2 CrossKD-O2O` 跨头梯度桥提供极高质量冻结 `Teacher O2O` 决策边界）。
+    - **`teacher_yolo26m` 实测完赛（2026-11-27 00:50 JST, L4, 65.26 min, 21.78M / 74.98G, `seed=42`）**：
+      - Val `90.08% / 60.82%`；Test O2O `86.52% / 57.99%`；Test O2M `87.47% / 58.7%`（`Δ_E2E +0.95% / +0.73%`）；Rect `87.59% / 59.6%`；**3 主类均分 `93.53%`**（`Bicycle 91.14%` 历史新高），但 `OtherVehicle` 过拟合跌至 `65.47%`（相对 `s` 的 `72.08%` 降 `-6.61%`）。
+      - **小样本容量匹配结论**：在 2K HIT-UAV 上，**`teacher_yolo26s` 在 Val、Test O2O、Rect 和 `Δ_E2E (-0.80%)` 全面优于 22M 的 `m`**，同时速度 3.3× 更快、容量差更小（`4×` vs `8.6×`），自然成为 HIT-UAV 最佳蒸馏教师（`YOLO26m` 留给 18K `DroneVehicle` 主战场）。
+    - **`kd_yolo26.py` + `run_phase3_auto.py` 经 Astra 对抗审计全量加固（commit `b57ce0c`, 2026-11-27 00:39 JST）**：
+      - 已修复全部 3 P0 + 7 P1 + 3 P2：KD 非有限直接 `FloatingPointError` 熔断、子进程非零退出立即失败（绝不误判为 `SCENARIO_C_BRAKE`）、**全链路严格 Val-Only 选老师/赢家/5-seed（零 Test 泄漏）**、去掉学生 pre-hook 直用 `s_o2m["feats"]`、完整 `kd_state.pt`（adapters + AdamW 矩）同步恢复、训完中断直跳过训练补评测、`validate_teacher_compatibility`、硬 `timeout` 防挂死、Gate 1 正式 `batch=32` + `adapter_steps>=1` + `best.pt` 字节流纯净度校验、精确无截断 `compute_soft_bce_kd`、锁死 `ultralytics==8.4.219`。
+      - **实时运行中（2026-11-27 00:52 JST 启动）**：Colab Pro L4 正在跑 `EXP_LIST = ["auto_phase3_overnight"]`（`SMOKE_TEST=False, AUTO_UNASSIGN=True`）。**Gate 0 + Gate 1 已于 00:54 JST 一次性绿灯通关**：Val-Only 自动锁定 `teacher_yolo26s` (`0.71774 > 0.71059`)；2-ep 正式 `batch=32` 冒烟耗时 119s、`peak_vram=7.28 GB`、`adapter_steps=80 / kd_batches=128`、`best.pt` 强验为 **100% 纯净原生 `2.5353M / 708 tensors / 0 KD refs`**（2 ep 即达 Test O2O `55.00% / 30.12%`, `3cls 73.16%`），现已进入 Gate 2 正式训练！Drive 实时决策日志 ID：`10JCZD82G2ip6zWtUGwvDHrWe2gKAqqEI` (`logs/auto_phase3_report.md`)。
     - **`kd_yolo26.py` 零延迟三模块蒸馏引擎已落地（2026-11-26 23:57 JST）**：
       - 实现 `src/modules/kd_yolo26.py`（`M1 F-PKD` + `M2 CrossKD-O2O` 绕过 `x_detach` + `M3 QG-CIoU-L1` 无分布双头校准 + 公平对照基线 `CWD` / `Official PR#24894 L2` / `QG-KD 1-IoU` + Track B 夜间熔断与双师优势门控原语）；
       - 适配器独立 `AdamW` 随 `GradScaler` 步进（绕过 `MuSGD` 正交化与 `LambdaLR` 冲突），`deepcopy`/`pickle` 严格剥离教师与适配器（确保导出 `best.pt` 为 100% 纯净 `2.535M / 6.035G / 418 FPS` 原生 `YOLO26n`）；
