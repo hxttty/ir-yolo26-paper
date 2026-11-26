@@ -11,7 +11,7 @@
   - **主轴护城河**：诊断并修复 **YOLO26 原生无 NMS 一对一匹配（O2O）+ 无 DFL（`reg_max=1`）** 在高空密集红外弱小目标下的结构性失效（实测基线端到端折损 $\Delta_{\text{E2E}} = +2.32\%$ mAP50，近 COCO 的 3 倍），并首次揭示及数学修复**朴素 NWD 注入 `TaskAlignedAssigner` 引发的 O2O 置信度爆炸崩盘（Ep 19–28）**。
 
 ## 2. 工程环境与云端 ID 速查（随时一键拉取，无需重搜）
-- **本地与 GitHub**：`/Users/xiaoyuhe/Documents/Gemini-home/ir-yolo26-paper` ↔ `https://github.com/hxttty/ir-yolo26-paper.git`（当前 V3 主分支最新 commit `e8c6f92`，已推送至 `origin/main`）。
+- **本地与 GitHub**：`/Users/xiaoyuhe/Documents/Gemini-home/ir-yolo26-paper` ↔ `https://github.com/hxttty/ir-yolo26-paper.git`（当前主分支最新 commit `3afc031`，已推送至 `origin/main`）。
 - **Colab Pro 环境**：`NVIDIA L4 (22.5 GB VRAM / 53 GB RAM)`，`Python 3.13.16`，`PyTorch 2.14.1+cu130`，`ultralytics 8.4.218`，余额 **`170.41 CU`**（2026-11-25 21:04）。
 - **Google Drive 插件（`gdrive`，账号 `hxy.new@gmail.com`）直达 ID**：
   - 项目根目录 `ir-yolo26-paper/`：`1JCEzpmRCHUnWOEdfaLCE64sSus3oHjwG`
@@ -75,5 +75,12 @@
 - **V3.1 破局方案（`IR-Reg` 黄金协议 + 剔除有毒 `e1`，合体 `Pillar 1c + Pillar 2 + Pillar 3`）**：
   - 协议：`hsv_h=0.0, hsv_s=0.0`（物理干净）+ 恢复 `hsv_v=0.4, erasing=0.4, close_mosaic=10` + `cache="disk", deterministic=True, align_val_rect_false=True`。
   - 已在 `configs/experiments.py` 新增 7 个 V3.1 预设（`v31_e0_base`, `v31_e1_p1c_piou`, `v31_e2_bitc_safe`, `v31_e3_caa_res`, `v31_e4_arch_combo`, `v31_e5_champion`, `v31_e5b_champ_boxkd`）。
-  - **立刻执行的 V3.1 核心 4 组门控队列**：`["v31_e0_base", "v31_e1_p1c_piou", "v31_e4_arch_combo", "v31_e5_champion"]`（强烈建议用 **L4** 跑，~2.5 小时 / ~6 CU）。
-  - 跑通 `v31_e5_champion` 后：补单模块消融 (`v31_e2_bitc_safe`, `v31_e3_caa_res`) + **基线 vs 冠军 5-seed 配对**（`42, 0, 3407, 2025, 2026`）+ SOTA 横向表 + ONNX CPU / TensorRT FP16 尾延迟 + 第二红外数据集 **`DroneVehicle-IR`**。
+  - **V3.1 四组核心门控实测完赛（2026-11-26 09:24–12:10 JST, L4, `IR-Reg`, `val rect=F`, `seed=42`, `Ultralytics 8.4.219`）**：
+    - `v31_e0_base`（Ep 69/119）：Val `89.55/59.50`，**Test O2O `84.26% / 54.19%`**，O2M `86.32%`，`Δ_E2E +2.06% / +1.40%`，`3cls 92.14%`，`OtherVeh 60.61%`，`Rect 85.50%`，`2.40 ms`；
+    - `v31_e1_p1c_piou`（Ep 83/133, **0ms**）：Val `89.71/59.81`，**Test O2O `84.94% / 55.05%`** (`+0.68/+0.86`)，O2M `85.38%`，**`Δ_E2E +0.44% / +0.47%`**，**`3cls 92.61%`** (`+0.47%`)，`OtherVeh 61.95%`，`Rect 85.94%`，`2.37 ms`；
+    - `v31_e4_arch_combo`（Ep 48/98）：Val `90.24/58.45`，**Test O2O `85.85% / 54.44%`** (`+1.59/+0.25`)，O2M `86.34%`，**`Δ_E2E +0.50% / +1.03%`**，`3cls 92.18%`，`OtherVeh 66.85%`，`Rect 86.36% / 55.2%`，`2.93 ms`；
+    - `v31_e5_champion`（Ep 110/160）：Val `90.14/60.43`（O2M Val `91.9/61.7`），**Test O2O `85.14% / 55.23%`** (`+0.88/+1.04`)，O2M `85.75%`，**`Δ_E2E +0.61% / +0.30%`**，`3cls 92.30%`，`OtherVeh 63.66%`，**`Rect 86.64% / 56.80%`**（`P=89.9/R=83.6`），`2.86 ms`，门控全激活（`BiTC=0.098, CAA-P3=0.108, CAA-P4=0.121`）。
+  - **关键破案与 V3.2 修正（2026-11-26 12:15 JST）**：
+    - 相对 `v31_e0_base`，三大支柱全员正增益且把 `Δ_E2E` 从 `+2.06% / +1.40%` 压至 `+0.44%~+0.61% / +0.30%`；
+    - **但 `v31_e0_base`（纯官方模型）比 `p0_yolo26n_musgd`（`87.67/57.51`, O2M `89.98%`）低了 `-3.41% / -3.32%`**；逐行 diff 锁定元凶为 `align_val_rect_false=True`（+ `cache="disk"` + `hsv_h/s=0` + `8.4.219`）导致 Ep 69 锁死次优 `best.pt`（而 `p0` 在 `val rect=True` 下于 Ep 84 选出 `Val 93.2/63.5`）。
+    - 已新增 **V3.2 官方零漂移协议预设**（`v32_e0_base`, `v32_e1_p1c_piou`, `v32_e2_bitc_safe`, `v32_e3_caa_res`, `v32_e4_arch_combo`, `v32_e5_champion`：`val rect=True, cache=True`, 官方默认 aug），立即在热 L4 跑 `["v32_e0_base", "v32_e1_p1c_piou", "v32_e5_champion"]` 验血夺回 90% O2M 高底座！

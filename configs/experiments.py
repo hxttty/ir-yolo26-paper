@@ -843,6 +843,105 @@ PRESETS: Dict[str, ExperimentConfig] = {
         use_v3_neck=True,
         v3_neck_variant="caa",
     ),
+    # =========================================================================
+    # Phase 1 V3.2: Official Ultralytics Protocol (ZERO protocol drift vs p0!)
+    #   Root-cause autopsy of V3.1 (seed=42, L4):
+    #     - Relative to v31_e0_base (84.26/54.19, O2M 86.32), ALL 3 pillars gave
+    #       positive gains & crushed Δ_E2E (+2.06% -> +0.44%~+0.61%).
+    #     - HOWEVER, align_val_rect_false=True + cache="disk" + hsv_h/s=0
+    #       caused v31_e0_base to lock a suboptimal best.pt at Ep 69 (-3.41% mAP50
+    #       / -3.32% mAP50-95 / -3.66% O2M vs p0_yolo26n_musgd 87.67/57.51)!
+    #   V3.2 restores 100% official Ultralytics train/val defaults (val rect=True,
+    #   cache=True, default hsv/erasing/close_mosaic=10) so V3.2 stands on the
+    #   exact same ~90% O2M ceiling as p0_yolo26n_musgd.
+    # =========================================================================
+    "v32_e0_base": ExperimentConfig(
+        exp_name="v32_e0_base",
+        phase="v32",
+        notes="V3.2 E0 Official-Protocol Baseline YOLO26n (exact p0_yolo26n_musgd recipe: val rect=T, cache=ram, default aug)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+    ),
+    "v32_e1_p1c_piou": ExperimentConfig(
+        exp_name="v32_e1_p1c_piou",
+        phase="v32",
+        notes="V3.2 E1 Official-Protocol + Pillar 1c (O2O Annealed NWD A0=256 + Dead-Anchor Floor + PIoU2, 0ms)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+        use_v3_odcs=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="piou2",
+    ),
+    "v32_e2_bitc_safe": ExperimentConfig(
+        exp_name="v32_e2_bitc_safe",
+        phase="v32",
+        notes="V3.2 E2 Official-Protocol + Pillar 2: Border-Safe BiTC-Stem (+608 params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+        use_v3_bitc=True,
+    ),
+    "v32_e3_caa_res": ExperimentConfig(
+        exp_name="v32_e3_caa_res",
+        phase="v32",
+        notes="V3.2 E3 Official-Protocol + Pillar 3: Border-Safe CAA-Res (+11.8K params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
+    "v32_e4_arch_combo": ExperimentConfig(
+        exp_name="v32_e4_arch_combo",
+        phase="v32",
+        notes="V3.2 E4 Official-Protocol + Pillar 2+3: Border-Safe BiTC-Stem + CAA-Res (+12.4K params)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+        use_v3_bitc=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
+    "v32_e5_champion": ExperimentConfig(
+        exp_name="v32_e5_champion",
+        phase="v32",
+        notes="V3.2 Champion (Official-Protocol): Pillar 1c (O2O Anneal+PIoU2) + Pillar 2 (BiTC-Safe) + Pillar 3 (CAA-Res)",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=200,
+        batch=32,
+        cache=True,
+        align_val_rect_false=False,
+        use_v3_odcs=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="piou2",
+        use_v3_bitc=True,
+        use_v3_neck=True,
+        v3_neck_variant="caa",
+    ),
 }
 
 
