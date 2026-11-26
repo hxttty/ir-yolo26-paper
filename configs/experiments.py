@@ -1214,6 +1214,56 @@ PRESETS: Dict[str, ExperimentConfig] = {
         v3_reg_loss_type="ciou",
         extra_train_kwargs={"cos_lr": True},
     ),
+    # =========================================================================
+    # Phase 3 Kill-Shot: Zero-Latency Dual-Head Distillation Teachers (YOLO26s/m/l)
+    #   Rationale: 38 architectural/loss runs proved P3-P5 micro-tweaks hit +0.18%
+    #   3-seed ceiling while P2/4 (34K anchors) overfit 2K HIT-UAV (-1.5% & +56%
+    #   latency). Step 1: benchmark strong same-family YOLO26s/m/l teachers on
+    #   HIT-UAV (100ep cos_lr) to measure exact distillation headroom & save
+    #   frozen teacher checkpoints for Dual-Head DFL-Free IR Distillation (+0.00ms)!
+    # =========================================================================
+    "teacher_yolo26s": ExperimentConfig(
+        exp_name="teacher_yolo26s",
+        phase="teacher",
+        notes="Distillation Teacher Probe (100ep cos_lr): Official YOLO26s (10.0M, 22.8G) on HIT-UAV 4cls",
+        model_cfg="yolo26s.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "teacher_yolo26m": ExperimentConfig(
+        exp_name="teacher_yolo26m",
+        phase="teacher",
+        notes="Distillation Teacher Probe (100ep cos_lr): Official YOLO26m (21.9M, 75.4G) on HIT-UAV 4cls",
+        model_cfg="yolo26m.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=16,
+        close_mosaic=10,
+        cache=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "teacher_yolo26l": ExperimentConfig(
+        exp_name="teacher_yolo26l",
+        phase="teacher",
+        notes="Distillation Teacher Probe (100ep cos_lr): Official YOLO26l (26.3M, 93.8G) on HIT-UAV 4cls",
+        model_cfg="yolo26l.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=16,
+        close_mosaic=10,
+        cache=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
 }
 
 
