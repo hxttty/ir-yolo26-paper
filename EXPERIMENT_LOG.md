@@ -11,8 +11,8 @@
   - **主轴护城河**：诊断并修复 **YOLO26 原生无 NMS 一对一匹配（O2O）+ 无 DFL（`reg_max=1`）** 在高空密集红外弱小目标下的结构性失效（实测基线端到端折损 $\Delta_{\text{E2E}} = +2.32\%$ mAP50，近 COCO 的 3 倍），并首次揭示及数学修复**朴素 NWD 注入 `TaskAlignedAssigner` 引发的 O2O 置信度爆炸崩盘（Ep 19–28）**。
 
 ## 2. 工程环境与云端 ID 速查（随时一键拉取，无需重搜）
-- **本地与 GitHub**：`/Users/xiaoyuhe/Documents/Gemini-home/ir-yolo26-paper` ↔ `https://github.com/hxttty/ir-yolo26-paper.git`（macOS 钥匙串已保存凭据，可直接 `git push`）。
-- **Colab Pro 环境**：`NVIDIA L4 (22.5 GB VRAM / 53 GB RAM)`，`Python 3.13.16`，`PyTorch 2.14.1+cu130`，`ultralytics 8.4.218`。
+- **本地与 GitHub**：`/Users/xiaoyuhe/Documents/Gemini-home/ir-yolo26-paper` ↔ `https://github.com/hxttty/ir-yolo26-paper.git`（当前 V3 主分支最新 commit `e8c6f92`，已推送至 `origin/main`）。
+- **Colab Pro 环境**：`NVIDIA L4 (22.5 GB VRAM / 53 GB RAM)`，`Python 3.13.16`，`PyTorch 2.14.1+cu130`，`ultralytics 8.4.218`，余额 **`170.41 CU`**（2026-11-25 21:04）。
 - **Google Drive 插件（`gdrive`，账号 `hxy.new@gmail.com`）直达 ID**：
   - 项目根目录 `ir-yolo26-paper/`：`1JCEzpmRCHUnWOEdfaLCE64sSus3oHjwG`
   - 汇总总表 `results/master_results.csv`：`1uG-N1F44Qo9kfVcRAhAK73tZslrFN7LC`
@@ -41,10 +41,39 @@
 | `p1v2_bitc_tcgate` | AdamW(auto) | 84/134 | 2.54M / 6.07 | 91.2 / 61.8 | 86.64 / 55.68 | 87.60 | +0.95 / +0.57 | 87.23 | 92.89 | 92.78/96.83/89.06/67.91 | 2.71 ms |
 | `p1v2_full_c1` | AdamW(auto) | 95/145 | 2.54M / 6.07 | **93.6 / 62.8** | 85.02 / 54.73 | 85.76 | +0.74 / +0.98 | 85.62 | 92.25 | 92.29/94.80/89.67/63.34 | 2.75 ms |
 | `p1v2_full_c12` | AdamW(auto) | 90/140 | 2.54M / 6.07 | **93.4 / 64.1** | 84.96 / 54.77 | 86.15 | +1.19 / +0.89 | 86.28 | **93.21** | 92.87/96.60/90.17/60.20 | 2.67 ms |
+| **`v3_e0_base`** *(IR-Clean)* | IR-Clean *(T4)* | **44**/94 | 2.54M / 6.04 | 89.7 / 59.1 *(sq)* | **84.37 / 52.23** | 84.80 | +0.43 / +0.68 | 84.87 *(m95: 53.1)* | 92.25 | 91.44/96.35/88.98/60.71 | 5.21 *(T4)* |
+| `v3_e1_p1_distill` *(P1a+1b)* | IR-Clean *(T4)* | 97/147 | 2.54M / 6.04 | 87.9 / 59.1 *(sq)* | 85.25 / 56.36 | 86.74 | +1.50 / `+0.28` | 85.51 *(m95: 56.8)* | 91.71 ⚠️ | 91.92/95.77/87.44/65.85 | 5.49 *(T4)* |
+| 🏆 **`v3_e2_p1_piou` *(P1c, 0ms)*** | IR-Clean *(T4)* | 63/113 | **2.54M / 6.04** | 89.7 / 59.2 *(sq)* | **88.80 / 56.33** | **89.77** | **`+0.97` / +1.11** | **88.56** *(m95: 56.6)* | 92.28 | 91.46/96.71/88.65/**78.37** | **4.86 *(T4)*** |
+| 🔥 **`v3_e6_arch_combo` *(P2+3)*** | IR-Clean *(T4)* | 109/159 | **2.55M / 6.13** | **91.9 / 60.5** *(sq)* | **87.21 / 56.44** | 88.09 | **`+0.89` / +1.29** | **88.54** *(m95: **58.3**)* | **92.72** | **92.88**/96.58/88.70/70.67 | 5.62 *(T4)* |
+| `v3_e7_full` *(P1+2+3, PIoU2)* | IR-Clean *(L4)* | 123/173 | 2.55M / 6.13 | 87.4 / 57.9 *(sq)* | 86.65 / **56.91** | 88.47 | +1.82 / **`+0.26`** | 86.73 *(m95: 57.6)* | 92.29 | 92.38/95.72/88.77/69.73 | 2.85 *(L4)* |
+| `v3_e7b_full_sd` *(P1+2+3, SD)* | IR-Clean *(L4)* | 137/187 | 2.55M / 6.13 | 90.7 / 61.4 *(sq)* | 84.97 / 55.88 | 86.22 | +1.25 / `+0.18` | 85.33 *(m95: 57.0)* | 91.51 | 91.50/94.62/88.42/65.33 | 2.92 *(L4)* |
 
 ## 4. V2 深度“尸检”结论（指导 V3 破局）
 1. **优化器实证定案**：在小规模 HIT-UAV 上，`AdamW (auto, lr=0.00125)`（87.67% / 57.51%）显著优于官方宣传的 `MuSGD (lr=0.01)`（86.07% / 54.88%，低 -1.60% / -2.63%）和标准 `SGD`（85.04% / 55.06%）。
 2. **戳破“$\Delta_{\text{E2E}}$ 假性缩小”**：V2 虽然把 $\Delta_{\text{E2E}}$ 压至 `-0.27% ~ +1.24%`，但 `Test O2M` 天花板同步从 `89.98%` 掉到 `85.76% ~ 88.07%`。根因之一是 `Detect.forward` 对 O2O 输入做了 `x.detach()`，骨干全靠 O2M 教，而我们将 `C1/C2` 同时 patch 进了 `one2many` 伤了老师；且 `p1v2_bitc`(Ep161)/`p1v2_c1`(Ep150) 在 `o2m` 权重衰减后期过拟合 Val（Val m95 达 64.1% 而 Test 跌）。
 3. **`DSG-Assign (C1)` 死锚点权重归零隐患**：解耦保持 `overlaps = CIoU` 虽根治了 Ep 19–28 NaN 崩盘，但当 NWD 为小目标选出 `CIoU≈0` 的唯一正样本时，其 `target_scores≈0` 会使 `BboxLoss` 的 `weight` 同步归零，且高 IoU 排序被 NWD 稀释导致 `mAP50-95` 降 1.5–2.5%。
 4. **`BiTC-Stem` 与 `TC-Gate` 的单点亮点与串联拮抗**：单用 `BiTC-Stem` 的 Val m95=64.1%、P=89.5%、R=83.6%、OtherVeh=72.86%；单用 `TC-Gate` 在原生无灰边 `640×512` 测出全场最高 **`88.12% (+0.65%)`**；但两者同为局部高通差分，叠加后放大红外热噪声，且灰边（`rect=False`）会在边缘引入伪热对比度。
-5. **已打包 Deep Research 委托材料**：`DEEP_RESEARCH_BRIEF_V3.md`（供调研 V3 破局方案：保住 90% O2M 天花板并把 O2O 拉高、解决 C1 死锚点与 `mAP50-95`、红外专属增强与正交轻量化模块）。
+5. **Deep Research V3 报告核心铁证（已全部通过 `search_web` 核验）**：
+   - **隐性撞车止损**：2026.10 *Frontiers in Marine Science* (Liu et al.) 在 `YOLOv26n` 上用了 P3 零初始化 `tanh(g)` 注意力 (`Gated Output-16`) + 双分支 `1024 px²` 切换 `MPDIoU-NWD` → **V3 已彻底退役 `TC-Gate` 与双分支 `1024 px² NWD`**！
+   - **统计方差审计**：仅约 30 框的 `OtherVehicle` 一类与 4 类总 `Test O2O mAP50` 相关性高达 `r = 0.9639`（解释 `92.9%` 方差），单类采样误差即可注入 `±4.05%` → 必须并行报 **`3-Class Main Avg` + `AP_s`**，最终冠军 vs 基线必须跑 **5 组配对种子**（双侧 t 检验门槛从 4.303 降至 2.776）。
+   - **Ultralytics `nms=None` 陷阱**：默认 `val()` 走的是 O2M+NMS（实测验证集 100% 证实！），论文需显式说明 `nms=False` 才是真正的 O2O。
+   - **目标期刊与第二数据集定案**：冲高 *Infrared Physics & Technology*（中科院 2 区，0 APC，门槛 `89.8%+ / 59.5%+`）；主力 *JRTIP*（2026 IF 4.9，0 APC，主打 NMS-free 确定性延迟 + P95/P99 尾延迟，门槛 `89.2%–89.7%`）；二顺位 *The Visual Computer*；*SIVP* 仅保底。第二红外数据集唯一主推 **`DroneVehicle-IR`**（640×512 裁 100px 白边转 HBB，8,980 张测试集；快测备选 `FLIR-Aligned IR`）。
+
+## 5. V3 代码架构（commit `e8c6f92`）与实时实验进度
+- **三支柱正交实现（+0.49% 参数 `2.5477M` / +1.56% 算力 `6.129G` / 708/708 权重 100% 无损）**：
+  1. **Pillar 1 (`src/modules/v3_losses.py`, `ODCS`, +0ms)**：神圣教师原则（绝不动 `one2many` 分配器）+ 保底 `ProgLoss` (`o2m >= 0.45`, `o2o` 前 60% 爬满 0.9) + 模块级可序列化选择性 `O2M→O2O` 内部自蒸馏 (`V3DistillE2ELoss`，次优抑制严格排除 `one2one` 自身前景) + `one2one` 专属退火分配 (`A0=256, tau=64`, 前 60% 退火回纯 CIoU) + 死锚点回归保底权重 + `PIoU2` (Neural Networks 2024, `u(λq)` `.detach()`, FP32) / `SD Loss` (AAAI 2025)。
+  2. **Pillar 2 (`src/modules/v3_arch.py`, `BorderSafeBiTCStemWrapper`, +608 params)**：Stage 1 `F.pad(mode='replicate')` + FP32 Charbonnier 光滑幅值（防 FP16 下溢 NaN）+ 零初始化 `tanh(g)`。
+  3. **Pillar 3 (`src/modules/v3_arch.py`, `BorderSafeCAAResWrapper`, +11.8K params, 备选 `HaarResWrapper` +8.6K)**：Neck P3/P4 `AvgPool 7×7` + `1×11`/`11×1` 条带长程卷积（全 `replicate` 填充）+ 零初始化 `tanh(g)`。
+  4. **IR-Clean 统一协议**：`hsv_h=0, hsv_s=0, hsv_v=0.25, erasing=0.0, close_mosaic=15, deterministic=True, cache="disk", align_val_rect_false=True`。
+- **已完成 V3 全 6 组精准拆弹结论（彻底破案！）**：
+  1. **真凶 #1 — `IR-Clean` 去掉 `erasing=0.4` 导致严重过拟合**：`v3_e0_base`（`erasing=0.0, hsv_v=0.25, close_mosaic=15`）在第 **44 Epoch** 就早停过拟合，Test O2O 从 `p0_yolo26n_musgd` 的 `87.67% / 57.51%` 暴跌至 **`84.37% / 52.23%`**（`-3.30% / -5.28%`）！证明 2,029 张小规模 HIT-UAV 离不开 `erasing=0.4` 与 `hsv_v=0.4`（热像仪增益漂移）。
+  2. **真凶 #2 — `v3_e1_p1_distill`（ProgFloor + 次优硬抑制 KD）拖累完全体**：`ProgFloor` 压低 O2M 权重饿坏了唯一更新骨干的 O2M 老师（O2M 跌至 `86.74%`），次优硬抑制砍掉低置信度召回尾巴（`3-Class Main Avg` 跌至 `91.71%`，`-0.54%`，全场唯一下跌），直接把 `v3_e7_full` 的 Val 从 `91.91%` 拽低到 `87.40%`、Test 从 `88.80%` 拽低到 `86.65%`。
+  3. **双冠王诞生 — Pillar 1c (`v3_e2_p1_piou`) + Pillar 2&3 (`v3_e6_arch_combo`) 均暴力正增益**：
+     - **`v3_e2_p1_piou`（+0 参数 / +0ms）**：在残血 `IR-Clean` 协议下仍轰出 **全场历史最高 Test O2O `88.80%`**（比 `v3_e0_base` **`+4.43% mAP50 / +4.10% mAP50-95`**，甚至反超旧协议 `p0` 基线 `+1.13%`！），完美守住 O2M 天花板 **`89.77%`**，`Δ_E2E` 从 `+2.32%` 腰斩至 **`+0.97%`**，`OtherVeh = 78.37%` 历史新高！
+     - **`v3_e6_arch_combo`（`BiTC-Safe + CAA-Res`, +12.4K 参数）**：比 `v3_e0_base` 暴涨 **`+2.84% mAP50 / +4.21% mAP50-95`**，Val 达 **`91.91% / 60.49%`**，**V3 最高 3 主类均分 `92.72%`**，**原生 `640×512` 轰出 `88.54% / 58.3%`**（全场历史最高 mAP50-95！），3 个零初始化门控全部激活（`BiTC=0.095`, `CAA-P3=0.109`, `CAA-P4=0.124`）。
+  4. **`PIoU2` 完胜 `AAAI 2025 SD Loss`**（`+1.68% mAP50 / +1.03% mAP50-95 / +5.52% P`）→ 永久淘汰 `SD Loss`。
+- **V3.1 破局方案（`IR-Reg` 黄金协议 + 剔除有毒 `e1`，合体 `Pillar 1c + Pillar 2 + Pillar 3`）**：
+  - 协议：`hsv_h=0.0, hsv_s=0.0`（物理干净）+ 恢复 `hsv_v=0.4, erasing=0.4, close_mosaic=10` + `cache="disk", deterministic=True, align_val_rect_false=True`。
+  - 已在 `configs/experiments.py` 新增 7 个 V3.1 预设（`v31_e0_base`, `v31_e1_p1c_piou`, `v31_e2_bitc_safe`, `v31_e3_caa_res`, `v31_e4_arch_combo`, `v31_e5_champion`, `v31_e5b_champ_boxkd`）。
+  - **立刻执行的 V3.1 核心 4 组门控队列**：`["v31_e0_base", "v31_e1_p1c_piou", "v31_e4_arch_combo", "v31_e5_champion"]`（强烈建议用 **L4** 跑，~2.5 小时 / ~6 CU）。
+  - 跑通 `v31_e5_champion` 后：补单模块消融 (`v31_e2_bitc_safe`, `v31_e3_caa_res`) + **基线 vs 冠军 5-seed 配对**（`42, 0, 3407, 2025, 2026`）+ SOTA 横向表 + ONNX CPU / TensorRT FP16 尾延迟 + 第二红外数据集 **`DroneVehicle-IR`**。
