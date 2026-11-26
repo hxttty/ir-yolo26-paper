@@ -1173,6 +1173,47 @@ PRESETS: Dict[str, ExperimentConfig] = {
         v3_neck_variant="caa",
         extra_train_kwargs={"cos_lr": True},
     ),
+    # =========================================================================
+    # Phase 2 P2/4 High-Resolution Probes (KEEP full P5 + smart shifted transfer!)
+    #   Rationale: 3-seed audit of V3.3 (42, 0, 3407) proved +12.4K P3-P5 tweaks
+    #   only yield +0.18% mAP50 / -0.05% mAP50-95 mean (P3/8 resolution ceiling
+    #   on 8x10px IR pedestrians). Unlike Mod A v1 (which pruned P5 and broke
+    #   pretraining), yolo26n-p2.yaml keeps full Backbone+SPPF+C2PSA+P5 while
+    #   adding a 4x denser P2/4 (160x160) detection grid (2.66M params, 9.5G).
+    # =========================================================================
+    "p2_probe_base": ExperimentConfig(
+        exp_name="p2_probe_base",
+        phase="p2probe",
+        notes="P2 Probe Base (100ep cos_lr): yolo26n-p2.yaml + full smart shifted yolo26n.pt pretrain (keeps P5)",
+        model_cfg="yolo26n-p2.yaml",
+        pretrained_weights="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p2_probe_odcs": ExperimentConfig(
+        exp_name="p2_probe_odcs",
+        phase="p2probe",
+        notes="P2 Probe + 0ms ODCS (100ep cos_lr): yolo26n-p2.yaml + O2O Annealed NWD(A0=256) + Dead-Anchor Floor",
+        model_cfg="yolo26n-p2.yaml",
+        pretrained_weights="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_v3_odcs=True,
+        v3_o2o_annealed_assign=True,
+        v3_reg_loss_type="ciou",
+        extra_train_kwargs={"cos_lr": True},
+    ),
 }
 
 

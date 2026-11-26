@@ -26,16 +26,65 @@ from src.modules.v3_arch import inject_v3_bitc_into_model, inject_v3_neck_into_m
 from src.modules.v3_losses import V3ODCSConfig, attach_v3_odcs_hook
 
 
+def _transfer_shifted_p2_pretrained(model: Any, weights_path: str) -> None:
+    """Transfer shifted PAN (17..22 -> 23..28) & Detect P3/P4/P5 (0..2 -> 1..3) weights
+    from 3-scale `yolo26n.pt` into 4-scale `yolo26n-p2.yaml` (preserving full P5 pretraining).
+    """
+    import torch
+
+    try:
+        from ultralytics import YOLO
+
+        src_yolo = YOLO(weights_path)
+        src_sd = src_yolo.model.state_dict()
+        dst_sd = model.state_dict()
+        del src_yolo
+    except Exception as exc:
+        print(f"[WARN] Smart P2 pretrained transfer skipped ({exc}).")
+        return
+
+    # Layer-index mapping: yolo26.yaml (24 layers) -> yolo26-p2.yaml (30 layers)
+    # Layers 0..16 match 1:1 (already transferred by Ultralytics); 17..22 shift by +6 -> 23..28.
+    layer_map = {17: 23, 18: 24, 19: 25, 20: 26, 21: 27, 22: 28}
+    transferred = 0
+    with torch.no_grad():
+        for src_k, src_v in src_sd.items():
+            dst_k = None
+            parts = src_k.split(".")
+            if len(parts) >= 3 and parts[0] == "model" and parts[1].isdigit():
+                idx = int(parts[1])
+                if idx in layer_map:
+                    dst_k = ".".join(["model", str(layer_map[idx])] + parts[2:])
+                elif idx == 23 and len(parts) >= 4 and parts[2] in (
+                    "cv2", "cv3", "one2one_cv2", "one2one_cv3"
+                ) and parts[3].isdigit():
+                    head_idx = int(parts[3])
+                    dst_k = ".".join(["model", "29", parts[2], str(head_idx + 1)] + parts[4:])
+            if dst_k and dst_k in dst_sd and dst_sd[dst_k].shape == src_v.shape:
+                dst_sd[dst_k].copy_(src_v.to(dtype=dst_sd[dst_k].dtype, device=dst_sd[dst_k].device))
+                transferred += 1
+
+    print(
+        f"[P2 PRETRAIN] Smart shifted weight transfer <- {weights_path}: "
+        f"copied {transferred} extra PAN(23..28)+Detect(P3-P5) tensors."
+    )
+
+
 def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
     """Attach structural (V1/V2/V3), protocol alignment, and supervision hooks."""
     needs_struct = cfg.use_mod_b or cfg.use_tc_gate or cfg.use_v3_bitc or cfg.use_v3_neck
-    if needs_struct or cfg.align_val_rect_false:
+    needs_p2_transfer = bool(cfg.pretrained_weights and "p2" in cfg.model_cfg.lower())
+    if needs_struct or needs_p2_transfer or cfg.align_val_rect_false:
         def _on_pretrain_routine_start(trainer: Any) -> None:
-            if needs_struct:
+            if needs_struct or needs_p2_transfer:
                 orig_setup_model = trainer.setup_model
 
                 def _wrapped_setup_model() -> Any:
                     ckpt = orig_setup_model()
+                    if needs_p2_transfer:
+                        m = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+                        if hasattr(m, "model") and len(m.model) == 30:
+                            _transfer_shifted_p2_pretrained(m, str(cfg.pretrained_weights))
                     # Legacy V1/V2 structural hooks
                     if cfg.use_mod_b:
                         inject_tcad_into_model(
