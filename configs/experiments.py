@@ -116,6 +116,46 @@ class ExperimentConfig:
     v3_caa_pool_kernel: int = 7
     v3_caa_strip_kernel: int = 11
 
+    # --- Phase 3: Zero-Inference-Overhead Dual-Head & DFL-Free Knowledge Distillation ---
+    use_kd: bool = False                     # Master switch (+0 params, +0 FLOPs, +0.00 ms at inference!)
+    kd_teacher_run: Optional[str] = None     # Auto-resolved Drive/local teacher run name (e.g. "teacher_yolo26s")
+    kd_teacher_weights: Optional[str] = None # Optional explicit path to frozen teacher .pt
+    kd_use_ema_teacher: bool = True
+    kd_use_m1_feat: bool = True              # M1: Neck P3-P5 feature KD
+    kd_feat_mode: str = "fpkd"               # "fpkd" (ours), "cwd" (ICCV21), "official_l2" (PR#24894), "none"
+    kd_use_m2_cross_o2o: bool = True         # M2: CrossKD-O2O gradient bridge bypassing `x_detach`
+    kd_use_m3_qg_head: bool = True           # M3: Quality-Gated DFL-Free Dual-Head Calibration
+    kd_lambda_feat: float = 1.0
+    kd_lambda_cross: float = 0.5
+    kd_lambda_head: float = 1.0
+    kd_warmup_epochs: int = 5
+    kd_decay_frac: float = 0.10
+    kd_final_scale: float = 0.10
+    kd_stal_min_radius: float = 1.0
+    kd_bg_weight: float = 0.05
+    kd_cwd_tau: float = 4.0
+    kd_lowpass_feat: bool = False            # Track B: 3x3 AvgPool low-frequency filter for partial alignment
+    kd_cross_box_weight: float = 1.0
+    kd_cross_cls_weight: float = 1.0
+    kd_cross_sup_weight: float = 0.25
+    kd_cross_tau: float = 2.0
+    kd_cross_q_thresh: float = 0.20
+    kd_box_mode: str = "ciou_l1"             # "ciou_l1" (ours), "iou" (QG-KD 2026), "giou" (BMGKD 2026)
+    kd_gamma_l1: float = 1.0
+    kd_q_thresh: float = 0.20
+    kd_q_margin: float = 0.01
+    kd_use_advantage_weight: bool = True
+    kd_small_boost_kappa: float = 1.0
+    kd_small_boost_s0: float = 32.0
+    kd_cls_tau: float = 2.0
+    kd_m3_o2m_weight: float = 0.5
+    kd_m3_o2o_weight: float = 1.0
+    kd_m3_box_weight: float = 1.0
+    kd_m3_cls_weight: float = 1.0
+    kd_use_runner_up_kd: bool = True
+    kd_runner_up_weight: float = 0.25
+    kd_use_soft_gt_blend: bool = False
+
     # --- Extra Ultralytics train kwargs ---
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
 
@@ -1264,6 +1304,339 @@ PRESETS: Dict[str, ExperimentConfig] = {
         cache=True,
         extra_train_kwargs={"cos_lr": True},
     ),
+    # =========================================================================
+    # Phase 3: Zero-Inference-Overhead Dual-Head & DFL-Free Distillation Suite
+    #   Student stays 100% pure YOLO26n (2.535M / 6.035G / 418 FPS / +0.00ms)!
+    #   Identical 100ep cos_lr protocol as v33_e0_base (3-seed: 86.63% / 56.45%).
+    # =========================================================================
+    # --- Track A (Teacher = YOLO26s: 88.01% O2O / 58.27% m95 / Δ_E2E=-0.80%) ---
+    "p3_kd_m1_fpkd_s": ExperimentConfig(
+        exp_name="p3_kd_m1_fpkd_s",
+        phase="phase3",
+        notes="Phase 3 Ablation M1 (n<-s, +0ms): STAL-Floored Foreground Pearson KD (F-PKD) on Neck P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_m12_cross_s": ExperimentConfig(
+        exp_name="p3_kd_m12_cross_s",
+        phase="phase3",
+        notes="Phase 3 Ablation M1+M2 (n<-s, +0ms): F-PKD + CrossKD-O2O gradient bridge bypassing x_detach",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_m3_qg_s": ExperimentConfig(
+        exp_name="p3_kd_m3_qg_s",
+        phase="phase3",
+        notes="Phase 3 Ablation M3 (n<-s, +0ms): Quality-Gated DFL-Free QG-CIoU-L1 + Dual-Head Cls KD",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=False,
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_full_s": ExperimentConfig(
+        exp_name="p3_kd_full_s",
+        phase="phase3",
+        notes="Phase 3 Full Ours (n<-s, +0ms): M1 F-PKD + M2 CrossKD-O2O + M3 QG-CIoU-L1 Dual-Head KD",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_full_norun_s": ExperimentConfig(
+        exp_name="p3_kd_full_norun_s",
+        phase="phase3",
+        notes="Phase 3 Ablation (n<-s, +0ms): Full M1+M2+M3 without M3 runner-up calibration",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=True,
+        kd_use_runner_up_kd=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_cwd_s": ExperimentConfig(
+        exp_name="p3_kd_base_cwd_s",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-s, +0ms): CWD (ICCV 2021) spatial-channel softmax KL on P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="cwd",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_l2_s": ExperimentConfig(
+        exp_name="p3_kd_base_l2_s",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-s, +0ms): Ultralytics PR #24894 style confidence-weighted L2 on P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=True,
+        kd_feat_mode="official_l2",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_qg_iou_s": ExperimentConfig(
+        exp_name="p3_kd_base_qg_iou_s",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-s, +0ms): QG-KD (Electronics 2026) output-only 1-IoU + soft cls on O2O",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26s",
+        kd_use_m1_feat=False,
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=True,
+        kd_box_mode="iou",
+        kd_m3_o2m_weight=0.0,
+        kd_m3_o2o_weight=1.0,
+        kd_use_runner_up_kd=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    # --- Track A (Teacher = YOLO26m: 21.9M, 75.4G) ---
+    "p3_kd_m1_fpkd_m": ExperimentConfig(
+        exp_name="p3_kd_m1_fpkd_m",
+        phase="phase3",
+        notes="Phase 3 Ablation M1 (n<-m, +0ms): STAL-Floored Foreground Pearson KD (F-PKD) on Neck P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_m12_cross_m": ExperimentConfig(
+        exp_name="p3_kd_m12_cross_m",
+        phase="phase3",
+        notes="Phase 3 Ablation M1+M2 (n<-m, +0ms): F-PKD + CrossKD-O2O gradient bridge bypassing x_detach",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_m3_qg_m": ExperimentConfig(
+        exp_name="p3_kd_m3_qg_m",
+        phase="phase3",
+        notes="Phase 3 Ablation M3 (n<-m, +0ms): Quality-Gated DFL-Free QG-CIoU-L1 + Dual-Head Cls KD",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=False,
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_full_m": ExperimentConfig(
+        exp_name="p3_kd_full_m",
+        phase="phase3",
+        notes="Phase 3 Full Ours (n<-m, +0ms): M1 F-PKD + M2 CrossKD-O2O + M3 QG-CIoU-L1 Dual-Head KD",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=True,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_full_norun_m": ExperimentConfig(
+        exp_name="p3_kd_full_norun_m",
+        phase="phase3",
+        notes="Phase 3 Ablation (n<-m, +0ms): Full M1+M2+M3 without M3 runner-up calibration",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="fpkd",
+        kd_use_m2_cross_o2o=True,
+        kd_use_m3_qg_head=True,
+        kd_use_runner_up_kd=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_cwd_m": ExperimentConfig(
+        exp_name="p3_kd_base_cwd_m",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-m, +0ms): CWD (ICCV 2021) spatial-channel softmax KL on P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="cwd",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_l2_m": ExperimentConfig(
+        exp_name="p3_kd_base_l2_m",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-m, +0ms): Ultralytics PR #24894 style confidence-weighted L2 on P3-P5",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=True,
+        kd_feat_mode="official_l2",
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
+    "p3_kd_base_qg_iou_m": ExperimentConfig(
+        exp_name="p3_kd_base_qg_iou_m",
+        phase="phase3",
+        notes="Phase 3 Baseline (n<-m, +0ms): QG-KD (Electronics 2026) output-only 1-IoU + soft cls on O2O",
+        model_cfg="yolo26n.pt",
+        is_e2e_model=True,
+        optimizer="auto",
+        epochs=100,
+        patience=100,
+        batch=32,
+        close_mosaic=10,
+        cache=True,
+        use_kd=True,
+        kd_teacher_run="teacher_yolo26m",
+        kd_use_m1_feat=False,
+        kd_use_m2_cross_o2o=False,
+        kd_use_m3_qg_head=True,
+        kd_box_mode="iou",
+        kd_m3_o2m_weight=0.0,
+        kd_m3_o2o_weight=1.0,
+        kd_use_runner_up_kd=False,
+        extra_train_kwargs={"cos_lr": True},
+    ),
 }
 
 
@@ -1339,6 +1712,15 @@ def list_presets() -> str:
             flags.append("BiTC_v3")
         if cfg.use_v3_neck:
             flags.append(f"Neck_{cfg.v3_neck_variant}")
+        if cfg.use_kd:
+            kd_sub = []
+            if cfg.kd_use_m1_feat:
+                kd_sub.append(f"M1:{cfg.kd_feat_mode}")
+            if cfg.kd_use_m2_cross_o2o:
+                kd_sub.append("M2:CrossO2O")
+            if cfg.kd_use_m3_qg_head:
+                kd_sub.append(f"M3:{cfg.kd_box_mode}")
+            flags.append(f"KD({','.join(kd_sub)}<-{cfg.kd_teacher_run or 'custom'})")
         flag_str = "+".join(flags) if flags else "baseline"
         lines.append(
             f"  - {name:<26} [{cfg.phase:<6}] model={cfg.model_cfg:<30} mods={flag_str:<10} ({cfg.notes})"

@@ -107,3 +107,13 @@
   - **Phase 3 制胜一击：零延迟 YOLO26 双头无 DFL 红外知识蒸馏（2026-11-26 23:09 JST）**：
     - 战略：推理期 `+0 参数 / +0.00 ms`（稳守 `2.53M / 418 FPS`），彻底告别“2K 小图塞结构必过拟合或只涨 0.18%”死胡同；同时储备 `DroneVehicle` 配对 RGB→IR 特权跨模态蒸馏终极王牌。
     - 第一步先测同族强教师上限：新增 `teacher_yolo26s`, `teacher_yolo26m`, `teacher_yolo26l`（100ep `cos_lr`, `batch=32/16` 防 OOM），先跑 `["teacher_yolo26s", "teacher_yolo26m"]` 摸清蒸馏空间并留存冻结教师权重！
+    - **`teacher_yolo26s` 实测完赛（2026-11-26 23:44 JST, L4, 34.97 min, 9.95M / 22.75G, `seed=42`）**：
+      - Val `90.98% / 61.43%`（历史最高 Val `mAP50-95`）；
+      - **Test O2O (640×640)**：**`88.01% / 58.27%`**（相对 `v33_e0_base` `seed=42` **`+1.54% mAP50 / +1.93% mAP50-95`**；相对 3-seed 均值 `+1.38% / +1.82%`）；
+      - **Test Rect (原生 640×512)**：**`88.81% / 59.3%`**（相对 `v33_e0_base` `85.97%` 暴涨 **`+2.83% mAP50`**！）；
+      - **3 主类均分**：**`93.32%`**（`Person 93.58% / Car 96.22% / Bicycle 90.17%`，全 39 轮历史最高！`OtherVeh 72.08%`）；
+      - **关键机制实证**：`Δ_E2E = -0.80% / -0.06%`（`O2O 88.01%` 反超 `O2M+NMS 87.21%`！验证“强骨干容量彻底消除甚至逆转端到端鸿沟”，为 `M2 CrossKD-O2O` 跨头梯度桥提供极高质量冻结 `Teacher O2O` 决策边界）。
+    - **`kd_yolo26.py` 零延迟三模块蒸馏引擎已落地（2026-11-26 23:57 JST）**：
+      - 实现 `src/modules/kd_yolo26.py`（`M1 F-PKD` + `M2 CrossKD-O2O` 绕过 `x_detach` + `M3 QG-CIoU-L1` 无分布双头校准 + 公平对照基线 `CWD` / `Official PR#24894 L2` / `QG-KD 1-IoU` + Track B 夜间熔断与双师优势门控原语）；
+      - 适配器独立 `AdamW` 随 `GradScaler` 步进（绕过 `MuSGD` 正交化与 `LambdaLR` 冲突），`deepcopy`/`pickle` 严格剥离教师与适配器（确保导出 `best.pt` 为 100% 纯净 `2.535M / 6.035G / 418 FPS` 原生 `YOLO26n`）；
+      - 新增 16 组 Phase 3 完整消融与对比预设（`p3_kd_*_s` / `p3_kd_*_m`）及 Drive 教师权重自动解析器。

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from configs.experiments import ExperimentConfig
+from src.modules.kd_yolo26 import YOLO26KDConfig, attach_yolo26_kd_hook
 from src.modules.nwd_e2e import attach_nwd_e2e_hook
 from src.modules.tc_gate import inject_tc_gate_into_model
 from src.modules.tcad import inject_tcad_into_model
@@ -199,6 +200,48 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
             reg_both_heads=cfg.v3_reg_both_heads,
         )
         attach_v3_odcs_hook(model, odcs_cfg)
+
+    # Phase 3: Zero-Inference-Overhead Dual-Head & DFL-Free Knowledge Distillation
+    if cfg.use_kd:
+        kd_cfg = YOLO26KDConfig(
+            teacher_weights=str(cfg.kd_teacher_weights or ""),
+            use_ema_teacher=cfg.kd_use_ema_teacher,
+            use_m1_feat=cfg.kd_use_m1_feat,
+            feat_kd_mode=cfg.kd_feat_mode,
+            use_m2_cross_o2o=cfg.kd_use_m2_cross_o2o,
+            use_m3_qg_head=cfg.kd_use_m3_qg_head,
+            lambda_feat=cfg.kd_lambda_feat,
+            lambda_cross=cfg.kd_lambda_cross,
+            lambda_head=cfg.kd_lambda_head,
+            kd_warmup_epochs=cfg.kd_warmup_epochs,
+            kd_decay_frac=cfg.kd_decay_frac,
+            kd_final_scale=cfg.kd_final_scale,
+            stal_min_radius=cfg.kd_stal_min_radius,
+            bg_weight=cfg.kd_bg_weight,
+            cwd_tau=cfg.kd_cwd_tau,
+            lowpass_feat=cfg.kd_lowpass_feat,
+            cross_box_weight=cfg.kd_cross_box_weight,
+            cross_cls_weight=cfg.kd_cross_cls_weight,
+            cross_sup_weight=cfg.kd_cross_sup_weight,
+            cross_tau=cfg.kd_cross_tau,
+            cross_q_thresh=cfg.kd_cross_q_thresh,
+            box_kd_mode=cfg.kd_box_mode,
+            gamma_l1=cfg.kd_gamma_l1,
+            q_thresh=cfg.kd_q_thresh,
+            q_margin=cfg.kd_q_margin,
+            use_advantage_weight=cfg.kd_use_advantage_weight,
+            small_boost_kappa=cfg.kd_small_boost_kappa,
+            small_boost_s0=cfg.kd_small_boost_s0,
+            cls_tau=cfg.kd_cls_tau,
+            m3_o2m_weight=cfg.kd_m3_o2m_weight,
+            m3_o2o_weight=cfg.kd_m3_o2o_weight,
+            m3_box_weight=cfg.kd_m3_box_weight,
+            m3_cls_weight=cfg.kd_m3_cls_weight,
+            use_runner_up_kd=cfg.kd_use_runner_up_kd,
+            runner_up_weight=cfg.kd_runner_up_weight,
+            use_soft_gt_blend=cfg.kd_use_soft_gt_blend,
+        )
+        attach_yolo26_kd_hook(model, kd_cfg)
 
 
 def build_model_with_switches(cfg: ExperimentConfig, repo_root: Path) -> Any:

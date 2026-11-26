@@ -140,6 +140,37 @@ def run_experiment(
 
     from src.modules import attach_phase1_callbacks, build_model_with_switches
 
+    # Auto-resolve frozen KD teacher checkpoint from local SSD or persistent Drive archive
+    if cfg.use_kd:
+        resolved_teacher: Optional[Path] = None
+        if cfg.kd_teacher_weights and Path(cfg.kd_teacher_weights).is_file():
+            resolved_teacher = Path(cfg.kd_teacher_weights)
+        elif cfg.kd_teacher_run:
+            search_candidates = [
+                local_project / cfg.kd_teacher_run / "weights" / "best.pt",
+            ]
+            if drive_dir is not None:
+                search_candidates.append(drive_dir / "runs" / cfg.kd_teacher_run / "weights" / "best.pt")
+            for cand in search_candidates:
+                if cand.is_file():
+                    if drive_dir is not None and cand.is_relative_to(drive_dir):
+                        cached_dir = local_work_dir / "teacher_cache" / cfg.kd_teacher_run
+                        cached_dir.mkdir(parents=True, exist_ok=True)
+                        cached_pt = cached_dir / "best.pt"
+                        if not cached_pt.is_file():
+                            shutil.copy2(cand, cached_pt)
+                        resolved_teacher = cached_pt
+                    else:
+                        resolved_teacher = cand
+                    break
+        if resolved_teacher is None:
+            raise FileNotFoundError(
+                f"KD teacher weights not found! Looked for weights='{cfg.kd_teacher_weights}' "
+                f"and run='{cfg.kd_teacher_run}' under {local_project} / {drive_dir}."
+            )
+        cfg.kd_teacher_weights = str(resolved_teacher)
+        print(f"[PHASE 3 KD] Resolved frozen teacher checkpoint: {resolved_teacher}")
+
     if resume_ckpt is not None:
         from ultralytics import YOLO
 
