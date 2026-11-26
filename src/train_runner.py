@@ -274,10 +274,20 @@ def main() -> None:
         print(list_presets())
         return
 
+    # Support inline per-item seed syntax in Colab EXP_LIST: e.g. "v33_e0_base@s0"
+    exp_arg = args.exp
+    seed_override = args.seed
+    if "@s" in exp_arg:
+        base_exp, seed_str = exp_arg.rsplit("@s", 1)
+        if seed_str.isdigit():
+            exp_arg = base_exp
+            seed_override = int(seed_str)
+            print(f"[SEED OVERRIDE] Parsed '{args.exp}' -> preset='{exp_arg}', seed={seed_override}")
+
     cfg = get_experiment_config(
-        args.exp,
+        exp_arg,
         smoke_test=True if args.smoke_test else None,
-        seed=args.seed,
+        seed=seed_override,
         optimizer=args.optimizer,
         dataset_mode=args.dataset_mode,
         epochs=args.epochs,

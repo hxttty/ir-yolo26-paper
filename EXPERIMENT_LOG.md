@@ -87,6 +87,11 @@
       - `v32_e0_base`（Best Ep **84**/134）：Val `90.38/60.62`，**Test O2O `87.29% / 57.39%`**，**Test O2M `89.59% / 59.17%`**，`Δ_E2E +2.30% / +1.78%`，`3cls 92.68%`（100% 复现 `p0`，彻底证实之前低 3.4% 是 `align_val_rect_false=True` 导致）；
       - `v32_e1_p1c_piou`（Best Ep **97**/147）：Val **`91.31/60.98`** (`+0.93/+0.36`)，Test O2O `86.71% / 55.97%` (`-0.58/-1.42`)，Test O2M `86.86% / 56.63%` (`-2.73/-2.54`)，`Δ_E2E +0.15% / +0.66%`；
       - `v32_e5_champion`（Best Ep **161**/200）：Val **`92.09/61.23`** (`+1.71/+0.61` 历史最高)，Test O2O `86.20% / 56.24%` (`-1.09/-1.15`)，Test O2M `86.22% / 56.37%` (`-3.37/-2.80`)，`Δ_E2E +0.02% / +0.13%`。
-  - **V3.3 方案 A（100-Epoch 余弦退火 + Clean Close-Mosaic + 剥离 PIoU2，2026-11-26 15:08 JST）**：
-    - 诊断：`epochs=200` 线性衰减在 2,029 张 HIT-UAV 上导致 `e1/e5` 拖到 Ep 97/161 过拟合 290 张 Val（Val→Test 落差扩大到 `-5.89%`）且从未触发最后 10 轮 `close_mosaic` 干净精调；同时排查 `PIoU2` 削弱高 IoU 梯度对 `mAP50-95` 的伤害。
-    - 已新增 `v33_e0_base`, `v33_e1_p1c_ciou`, `v33_e1b_p1c_piou`, `v33_e2_arch_combo`, `v33_e3_full_ciou`（`epochs=100, patience=100, cos_lr=True, close_mosaic=10, val rect=True`），立即在热 L4 跑 4 组（~1.6 小时）！
+  - **V3.3 方案 A 实测完赛（2026-11-26 15:10–18:55 JST, T4, 100ep `cos_lr=True` + `close_mosaic=10`, `seed=42`）**：
+    - `v33_e0_base`（基线）：Val `90.64/60.55`，Test O2O `86.48% / 56.34%`，O2M `87.20%`，`Δ_E2E +0.73% / +0.38%`，`3cls 92.83%`，`Rect 85.97%`；
+    - `v33_e1_p1c_ciou`（仅 P1c-CIoU, 0ms）：Val `91.50/59.47`，Test O2O `86.08% / 54.94%`，O2M `87.09%`，`Rect 88.10%` (`+2.13%`)；
+    - `v33_e2_arch_combo`（仅 P2+P3）：Val `90.56/59.94`，Test O2O `86.61% / 55.64%`，O2M `87.42%`，`Rect 87.17%` (`+1.20%`)；
+    - 🏆 **`v33_e3_full_ciou`（完整体）**：Test O2O **`87.60% / 56.37%`** (`+1.13% / +0.03%`)，O2M **`88.14%`** (`+0.94%`)，**`Δ_E2E +0.54%`**，**`3cls 92.95%`**，**`Rect 87.63%`** (`+1.66%`)，`P=89.56%`。
+  - **正式转入路线 1（SCI 定稿实验阶段，主攻 *JRTIP / TVC*，2026-11-26 19:05 JST）**：
+    - `src/train_runner.py` 新增 `@s<seed>` 队列内联覆盖语法（零改 Colab Notebook 即可一条队列跑多 seed）；`configs/experiments.py` 补全单模块消融 (`v33_e2a_bitc_safe`, `v33_e2b_caa_res`)、统一 100ep SOTA 对比 (`v33_sota_yolov8n/10n/11n/12n`) 及 5-class 附录 (`v33_5cls_base/full`)。
+    - **下一步**：先跑 `v33_e0_base` vs `v33_e3_full_ciou` 的 `seed=0, 3407` 配对验证跨 seed 稳定性（随后补 `2025, 2026` 凑齐 5-seed paired t-test + SOTA 横向表 + L4/ONNX CPU 尾延迟 + `DroneVehicle-IR`）。
