@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -55,6 +56,8 @@ CLASS_MAP: Dict[str, int] = {
     "feright_car": 4,
     "feright-car": 4,
     "ferightcar": 4,
+    "feright": 4,
+    "freight": 4,
 }
 IGNORE_LABELS = {"*", "ignore", "ignored", "dontcare", "dont_care", ""}
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -129,6 +132,61 @@ def _download_hf_file(filename: str, dst_path: Path) -> Path:
     return dst_path
 
 
+def _dv_vertices(obj: ET.Element, xml_path: Path) -> List[Tuple[float, float]]:
+    """Return source-image vertices, or an empty list for a point annotation."""
+    def coord(node: ET.Element, field: str) -> float:
+        raw = node.findtext(field)
+        try:
+            value = float(raw or "")
+            if math.isfinite(value):
+                return value
+        except ValueError:
+            pass
+        raise ValueError(f"Malformed XML {xml_path}: invalid <{node.tag}>/{field} coordinate {raw!r}")
+
+    def numbered(node: ET.Element) -> List[Tuple[float, float]]:
+        indices = dict.fromkeys(
+            child.tag[1:] for child in node
+            if child.tag.startswith(("x", "y")) and child.tag[1:].isdigit()
+        )
+        return [(coord(node, f"x{i}"), coord(node, f"y{i}")) for i in indices]
+
+    poly = obj.find("polygon")
+    if poly is not None:
+        vertices = numbered(poly)
+        if len(vertices) < 2:
+            raise ValueError(f"Malformed XML {xml_path}: <polygon> needs at least two vertices")
+        return vertices
+
+    box = obj.find("bndbox")
+    if box is not None:
+        return [(coord(box, "xmin"), coord(box, "ymin")), (coord(box, "xmax"), coord(box, "ymax"))]
+
+    rotated = obj.find("robndbox")
+    if rotated is not None:
+        cx, cy, w, h, angle = (coord(rotated, key) for key in ("cx", "cy", "w", "h", "angle"))
+        c, s = math.cos(angle), math.sin(angle)
+        return [(cx + dx * c - dy * s, cy + dx * s + dy * c)
+                for dx in (-w / 2, w / 2) for dy in (-h / 2, h / 2)]
+
+    points = obj.find("points")
+    if points is not None:
+        vertices = numbered(points)
+        if points.find("x") is not None or points.find("y") is not None:
+            vertices.append((coord(points, "x"), coord(points, "y")))
+        vertices.extend((coord(pt, "x"), coord(pt, "y")) for pt in points.findall("point"))
+        return vertices if len(vertices) >= 2 else []
+
+    point = obj.find("point")
+    if point is not None:
+        coord(point, "x")
+        coord(point, "y")
+        return []
+    if obj.find("line") is not None:
+        return []
+    raise ValueError(f"Malformed XML {xml_path}: object missing recognized geometry")
+
+
 def _parse_dv_xml_to_hbb(
     xml_path: Path,
     *,
@@ -137,8 +195,9 @@ def _parse_dv_xml_to_hbb(
     out_h: int,
     unknown_counter: Counter,
     class_counter: Counter,
+    skipped_counter: Optional[Counter] = None,
 ) -> List[Tuple[int, float, float, float, float]]:
-    """Parse DroneVehicle VOC XML (polygon or bndbox), shift by `-pad`, convert to normalized YOLO HBB.
+    """Parse DroneVehicle VOC XML, shift by `-pad`, convert to normalized YOLO HBB.
 
     Fails fast on missing or corrupt XML; legitimate empty `<annotation>` with 0 objects returns `[]`.
     """
@@ -163,28 +222,15 @@ def _parse_dv_xml_to_hbb(
             unknown_counter[raw_name] += 1
             continue
 
-        xs: List[float] = []
-        ys: List[float] = []
-        poly = obj.find("polygon")
-        if poly is not None:
-            for k in ("1", "2", "3", "4"):
-                xe = poly.find(f"x{k}")
-                ye = poly.find(f"y{k}")
-                if xe is not None and ye is not None and xe.text and ye.text:
-                    xs.append(float(xe.text) - pad)
-                    ys.append(float(ye.text) - pad)
-        if len(xs) < 2:
-            bnd = obj.find("bndbox")
-            if bnd is not None:
-                xs = [float(bnd.findtext("xmin", "0")) - pad, float(bnd.findtext("xmax", "0")) - pad]
-                ys = [float(bnd.findtext("ymin", "0")) - pad, float(bnd.findtext("ymax", "0")) - pad]
-        if len(xs) < 2 or len(ys) < 2:
-            raise ValueError(
-                f"Malformed XML {xml_path}: known class '{raw_name}' missing valid <polygon>/<bndbox> coordinates!"
-            )
+        vertices = _dv_vertices(obj, xml_path)
+        if not vertices:
+            if skipped_counter is not None:
+                skipped_counter["point"] += 1
+            continue
 
-        raw_x1, raw_x2 = min(xs), max(xs)
-        raw_y1, raw_y2 = min(ys), max(ys)
+        xs, ys = zip(*vertices)
+        raw_x1, raw_x2 = min(xs) - pad, max(xs) - pad
+        raw_y1, raw_y2 = min(ys) - pad, max(ys) - pad
         raw_area = max((raw_x2 - raw_x1) * (raw_y2 - raw_y1), 1e-6)
 
         x1 = max(0.0, min(float(out_w), raw_x1))
@@ -293,17 +339,20 @@ def _process_single_pair(
     if not cv2.imwrite(str(out_rgb_img), rgb_crop, encode_params):
         raise OSError(f"cv2.imwrite failed for RGB image: {out_rgb_img}")
 
+    skipped: Counter = Counter()
     unk_ir: Counter = Counter()
     cls_ir: Counter = Counter()
     unk_rgb: Counter = Counter()
     cls_rgb: Counter = Counter()
 
     ir_boxes = _parse_dv_xml_to_hbb(
-        ir_xml, pad=pad_ir, out_w=w_ir, out_h=h_ir, unknown_counter=unk_ir, class_counter=cls_ir
+        ir_xml, pad=pad_ir, out_w=w_ir, out_h=h_ir, unknown_counter=unk_ir, class_counter=cls_ir,
+        skipped_counter=skipped,
     )
     # Use pre-resize `(w_rgb, h_rgb)` so normalized RGB labels stay geometrically exact!
     rgb_boxes = _parse_dv_xml_to_hbb(
-        rgb_xml, pad=pad_rgb, out_w=w_rgb, out_h=h_rgb, unknown_counter=unk_rgb, class_counter=cls_rgb
+        rgb_xml, pad=pad_rgb, out_w=w_rgb, out_h=h_rgb, unknown_counter=unk_rgb, class_counter=cls_rgb,
+        skipped_counter=skipped,
     )
     _write_yolo_txt(out_ir_lbl, ir_boxes)
     _write_yolo_txt(out_rgb_lbl, rgb_boxes)
@@ -318,6 +367,7 @@ def _process_single_pair(
         "n_rgb": len(rgb_boxes),
         "cls_ir": dict(cls_ir),
         "cls_rgb": dict(cls_rgb),
+        "point_artifacts_skipped": skipped["point"],
         "unk": dict(unk_ir + unk_rgb),
     }
 
@@ -573,6 +623,7 @@ def _write_yamls_and_split_lists(
             "rgb_boxes_total": int(sum(cls_rgb_tot.values())),
             "ir_per_class": dict(cls_ir_tot),
             "rgb_per_class": dict(cls_rgb_tot),
+            "point_artifacts_skipped": sum(int(r["point_artifacts_skipped"]) for r in recs),
             "unknown_skipped": dict(unk_tot),
         }
 

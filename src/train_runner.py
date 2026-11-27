@@ -719,20 +719,21 @@ def main() -> None:
         if args.drive_dir is not None:
             logs_dir = args.drive_dir / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
-            exp_log = (logs_dir / f"{cfg.exp_name}.log").open("w", encoding="utf-8")
-            latest_log = (logs_dir / "latest_run.log").open("w", encoding="utf-8")
-            log_files = [exp_log, latest_log]
+            for filename in (f"{cfg.exp_name}.log", "latest_run.log"):
+                log_files.append((logs_dir / filename).open("w", encoding="utf-8"))
 
             class _MultiLog(io.TextIOBase):
                 def write(self, s: str) -> int:
                     for lf in log_files:
-                        lf.write(s)
-                        lf.flush()
+                        if not lf.closed:
+                            lf.write(s)
+                            lf.flush()
                     return len(s)
 
                 def flush(self) -> None:
                     for lf in log_files:
-                        lf.flush()
+                        if not lf.closed:
+                            lf.flush()
 
             sink = _MultiLog()
             sys.stdout = _TeeStream(orig_out, sink)
