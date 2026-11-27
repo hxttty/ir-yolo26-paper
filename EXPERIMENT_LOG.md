@@ -148,3 +148,10 @@
         4. `train_runner.py` 落地唯一代目录 `gen_ep{N}_{uuid}` + SHA-256 暂存恢复 + `results.csv` 同步 + 配置变更拒绝旧续训 + 缺失 `best.pt` 绝不跳过（同时兼容 HIT-UAV 已完赛的旧版 `p3_kd_v2_full_s`）；
         5. `prepare_dronevehicle.py` 强制 4 目录/1:1 stem/XML 坐标完整性/互斥全覆盖昼夜清单、`dv_manifest.json`、坏包自动隔离重做、本地快路径自动补打缺失 Drive bundle；
         6. 所有 DroneVehicle E2E 预设加 `nms=False`（按原生 O2O 选 `best.pt`），Track A/B 对齐相同 IR 蒸馏权重，STAL 高斯前景 16-box 分块（误差 `0.00e+00`）。
+    - **Phase 4 DroneVehicle Wave 1 实测完赛（2026-11-27 19:16 JST，官方完整 17,990 train / 1,469 val / 8,980 test，切干净镜像 `nonameplease/DroneVehicleNoBorder`，Drive 永久缓存 `dronevehicle_bundle.zip` = `15afG6jfizdQpPYwznCjwOEE0k4DLd2Dt`）**：
+      - HIT-UAV v2 复盘 **`p3_kd_v2_full_s`**（修复 M3 锚点拔河后）：Val `89.39/59.44`（比昨晚 `+2.25/+0.68`），Test O2O `85.26/55.60`，`Δ_E2E` 压至 **`+0.49%`**，**Rect `87.27%`**（反超基线 `85.97%` **`+1.30%`**），3 主类 `92.59%`。
+      - **DroneVehicle Wave 1 三强基准全量实测（8,980 张测试集，50ep `cos_lr`，`seed=42`，`master_results_dronevehicle.csv` ID = `1l5QPyUWlsGdiM9k1E5WbHo1BR1gZQHCc`）**：
+        - **`dv_ir_yolo26n`（纯红外学生基线，2.54M / 447 FPS）**：Val `81.10/59.44` | Test O2O **`78.13/57.66`** | **Day `76.12/55.07`** | **Night `80.55/60.93`**（纯红外白天暴跌 `-4.43%/-5.86%`！）| Rect `78.60%` | `Δ_E2E +0.93%`（`car 97.07 / bus 93.63 / truck 75.99 / freight_car 64.01 / van 59.95`）；
+        - **`dv_ir_teacher_s`（红外主教师 YOLO26s，9.95M / 217 FPS）**：Val **`83.46/61.62`** | Test O2O **`79.94/59.62`** (`+1.81/+1.96`) | **Day `78.58/57.58`** | **Night `81.48/62.16`** | Rect `80.55%` | `Δ_E2E +0.71%`（`truck +3.14%, freight_car +2.53%, van +2.22%`）；
+        - **`dv_rgb_teacher_s`（特权 RGB 辅助教师 YOLO26s，9.95M）**：Val `78.70/56.20` | Test O2O `76.56/54.84` | **Day `79.35/59.67`**（🔥 **反超红外主教师 `+0.77% / +2.09%`，碾压红外学生 `+3.23% / +4.60%`！**）| **Night `70.37/45.00`**（💥 **暴跌 `-10.18% / -15.93%`！**）；
+      - **Track B 双师冒烟体检（`dv_kd_track_b_s_smoke`，甚至在 15 GB T4 上 `batch=32` 峰值显存仅 `9.11 GB`！）**：`MuSGD`, `batch=32/32`, `oom_retries=0`, `primary_steps=36`, `aux_steps=36`, `M1/M2/M3/CM_F/CM_C` 全部健康收敛，夜间熔断 `safe=48.4%(Mosaic)/29.8%(NoMosaic)`，双师优势门控 `gate=28.5%/27.9%`，导出权重 `2.5358M` 与基线零差异（顺便在冒烟阶段抓出 `verify_exported_student_purity` 拿从零 `c3=64` 比预训练 `c3=80` 的误报，已立即修复）。

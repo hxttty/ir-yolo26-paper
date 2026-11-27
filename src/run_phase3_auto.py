@@ -209,6 +209,30 @@ def load_kd_health(exp_dir_name: str, *, work_dir: Path, drive_dir: Optional[Pat
     return None
 
 
+def _classification_outputs(head):
+    for name in ("cv3", "one2one_cv3"):
+        branches = getattr(head, name, None)
+        if branches is not None:  # End-to-end fusion can remove the one-to-many branches.
+            for i, branch in enumerate(branches):
+                yield f"{name}.{i}", branch
+
+
+def _native_student_references(detection_model, yaml, nc):
+    from torch import nn
+
+    for initial_nc in dict.fromkeys((nc, 80)):
+        ref = detection_model(yaml, ch=3, nc=initial_nc, verbose=False)
+        origin = "native"
+        if initial_nc != nc:
+            # Fine-tuning can retain the COCO classifier's intermediate width at every scale.
+            for _, branch in _classification_outputs(ref.model[-1]):
+                conv = branch[-1]
+                branch[-1] = nn.Conv2d(conv.in_channels, nc, 1, bias=conv.bias is not None)
+            origin = "COCO-adapted native"
+        yield origin, ref
+        yield f"fused {origin}", ref.fuse()
+
+
 def verify_exported_student_purity(
     exp_dir_name: str,
     *,
@@ -248,7 +272,6 @@ def verify_exported_student_purity(
 
     # 2. If torch is available (always true on Colab), also verify exact param count, hook cleanliness & schema
     try:
-        import copy
         import torch
 
         ckpt = torch.load(str(best_pt), map_location="cpu", weights_only=False)
@@ -288,28 +311,35 @@ def verify_exported_student_purity(
                     nc = len(model_obj.names)
                 if nc is None or int(nc) <= 0:
                     return False, f"Cannot verify native schema: missing valid nc on {best_pt}"
+                nc = int(nc)
+                outputs = list(_classification_outputs(model_obj.model[-1]))
+                if not outputs:
+                    return False, "Missing final classification convolutions"
+                for name, branch in outputs:
+                    conv = branch[-1]
+                    if not isinstance(conv, torch.nn.Conv2d) or conv.out_channels != nc:
+                        return False, f"Expected final {name} classification convolution with {nc} outputs"
+
                 actual_schema = {k: tuple(v.shape) for k, v in sd.items()}
-                ref_model = DetectionModel(expected_yaml, ch=3, nc=int(nc), verbose=False)
-                unfused_schema = {k: tuple(v.shape) for k, v in ref_model.state_dict().items()}
-                if actual_schema == unfused_schema:
-                    schema_note = f", exact native {expected_yaml}(nc={int(nc)}) schema matched"
-                else:
-                    fused_schema = {k: tuple(v.shape) for k, v in copy.deepcopy(ref_model).fuse().state_dict().items()}
-                    if actual_schema == fused_schema:
-                        schema_note = f", exact fused native {expected_yaml}(nc={int(nc)}) schema matched"
-                    else:
-                        extra = sorted(set(actual_schema) - set(unfused_schema))[:5]
-                        missing = sorted(set(unfused_schema) - set(actual_schema))[:5]
-                        mismatched = [
-                            (k, actual_schema[k], unfused_schema[k])
-                            for k in sorted(set(actual_schema) & set(unfused_schema))
-                            if actual_schema[k] != unfused_schema[k]
-                        ][:5]
-                        return (
-                            False,
-                            f"State_dict schema mismatch vs native {expected_yaml}(nc={int(nc)}): "
-                            f"extra={extra}, missing={missing}, shape_diff={mismatched}",
+                closest_distance = float("inf")
+                for variant, ref in _native_student_references(DetectionModel, expected_yaml, nc):
+                    schema = {k: tuple(v.shape) for k, v in ref.state_dict().items()}
+                    if actual_schema == schema:
+                        schema_note = f", exact {variant} {expected_yaml}(nc={nc}) schema matched"
+                        break
+                    extra = actual_schema.keys() - schema.keys()
+                    missing = schema.keys() - actual_schema.keys()
+                    wrong_shapes = [k for k in actual_schema.keys() & schema.keys() if actual_schema[k] != schema[k]]
+                    distance = len(extra) + len(missing) + len(wrong_shapes)
+                    if distance < closest_distance:
+                        closest_distance = distance
+                        shape_diff = [(k, actual_schema[k], schema[k]) for k in sorted(wrong_shapes)[:5]]
+                        mismatch = (
+                            f"State_dict schema mismatch vs {variant} {expected_yaml}(nc={nc}): "
+                            f"extra={sorted(extra)[:5]}, missing={sorted(missing)[:5]}, shape_diff={shape_diff}"
                         )
+                else:
+                    return False, mismatch
             except ImportError as exc:
                 if expected_nc is not None:
                     return False, f"Native schema verification required nc={expected_nc}, but Ultralytics unavailable: {exc}"
