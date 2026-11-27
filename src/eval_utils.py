@@ -17,11 +17,29 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _assert_finite_metrics(tag: str, m: Dict[str, Any]) -> None:
+    for key in ("mAP50", "mAP50_95", "precision", "recall"):
+        val = m.get(key)
+        if val is None or not math.isfinite(float(val)):
+            raise ValueError(f"Non-finite or missing metric '{key}' in eval '{tag}': {m}")
 
 
 def _extract_metrics_dict(metrics: Any, class_names: Dict[int, str]) -> Dict[str, Any]:
@@ -174,6 +192,9 @@ def evaluate_checkpoint(
     from ultralytics.utils.torch_utils import get_flops, get_num_params
     from src.modules import extract_tcad_gate_stats  # Also ensures custom wrappers are importable for unpickling
 
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Checkpoint weights not found for evaluation: {weights_path}")
+
     model = YOLO(str(weights_path))
     n_layers = len(list(model.model.modules()))
     n_params = int(get_num_params(model.model))
@@ -188,6 +209,7 @@ def evaluate_checkpoint(
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "exp_name": exp_name,
         "weights": str(weights_path),
+        "weights_sha256": _file_sha256(weights_path),
         "dataset_mode": dataset_mode,
         "seed": seed,
         "is_e2e_model": is_e2e_model,
@@ -227,48 +249,52 @@ def evaluate_checkpoint(
     for split in ("val", "test"):
         tag = f"{split}_o2o_640" if is_e2e_model else f"{split}_nms_640"
         print(f"[EVAL] Running {tag} (split={split}, nms={primary_nms}, rect=False, imgsz={imgsz}) ...")
-        summary["evals"][tag] = _run_val(split, nms=primary_nms, rect=False, eval_imgsz=imgsz)
+        res = _run_val(split, nms=primary_nms, rect=False, eval_imgsz=imgsz)
+        _assert_finite_metrics(tag, res)
+        summary["evals"][tag] = res
 
-    # 2. Secondary O2M+NMS evaluation for E2E models -> compute Δ_E2E
+    # 2. Secondary O2M+NMS evaluation for E2E models -> compute Δ_E2E (strict fail-fast!)
     if is_e2e_model:
         for split in ("val", "test"):
             tag = f"{split}_o2m_640"
-            try:
-                print(f"[EVAL] Running {tag} (split={split}, nms=True) to measure Δ_E2E ...")
-                o2m = _run_val(split, nms=True, rect=False, eval_imgsz=imgsz)
-                summary["evals"][tag] = o2m
-                o2o = summary["evals"][f"{split}_o2o_640"]
-                summary[f"{split}_delta_e2e_map50"] = round(o2m["mAP50"] - o2o["mAP50"], 5)
-                summary[f"{split}_delta_e2e_map50_95"] = round(o2m["mAP50_95"] - o2o["mAP50_95"], 5)
-            except Exception as exc:
-                print(f"[WARN] Could not evaluate O2M (nms=True) on {split}: {exc}")
+            print(f"[EVAL] Running {tag} (split={split}, nms=True) to measure Δ_E2E ...")
+            o2m = _run_val(split, nms=True, rect=False, eval_imgsz=imgsz)
+            _assert_finite_metrics(tag, o2m)
+            summary["evals"][tag] = o2m
+            o2o = summary["evals"][f"{split}_o2o_640"]
+            summary[f"{split}_delta_e2e_map50"] = round(o2m["mAP50"] - o2o["mAP50"], 5)
+            summary[f"{split}_delta_e2e_map50_95"] = round(o2m["mAP50_95"] - o2o["mAP50_95"], 5)
 
-    # 3. Rectangular inference evaluation on Test (note: Ultralytics rect=True pads 512x640 -> 544x672)
+    # 3. Rectangular inference evaluation on Test (strict fail-fast; note 512x640 -> 544x672 under rect=True pad=0.5)
     if eval_rect_640x512:
         tag = "test_o2o_rect640x512" if is_e2e_model else "test_nms_rect640x512"
-        try:
-            print(f"[EVAL] Running rectangular {tag} (rect=True, imgsz=640; stride-32 padded) ...")
-            summary["evals"][tag] = _run_val("test", nms=primary_nms, rect=True, eval_imgsz=640)
-        except Exception as exc:
-            print(f"[WARN] Rectangular eval failed: {exc}")
+        print(f"[EVAL] Running rectangular {tag} (rect=True, imgsz=640; stride-32 padded ~544x672) ...")
+        rect_res = _run_val("test", nms=primary_nms, rect=True, eval_imgsz=640)
+        _assert_finite_metrics(tag, rect_res)
+        rect_res["input_shape_note"] = "rect_stride32_pad0.5_544x672"
+        summary["evals"][tag] = rect_res
 
-    # 3a. Automatic Daytime vs Nighttime subset evaluation when companion *_day.yaml / *_night.yaml exist
+    # 3a. Mandatory Daytime vs Nighttime subset evaluation for DroneVehicle (strict fail-fast!)
+    is_dv_dataset = dataset_yaml.stem.startswith("dronevehicle")
     for subset in ("day", "night"):
         sub_yaml = dataset_yaml.parent / f"{dataset_yaml.stem}_{subset}.yaml"
+        if is_dv_dataset and not sub_yaml.is_file():
+            raise FileNotFoundError(
+                f"DroneVehicle evaluation requires companion '{sub_yaml.name}', but it is missing!"
+            )
         if sub_yaml.is_file():
             tag = f"test_{subset}_640"
-            try:
-                print(f"[EVAL] Running {subset.upper()} breakdown {tag} ({sub_yaml.name}, nms={primary_nms}) ...")
-                summary["evals"][tag] = _run_val(
-                    "test",
-                    nms=primary_nms,
-                    rect=False,
-                    eval_imgsz=imgsz,
-                    data_yaml=sub_yaml,
-                    allow_plots=False,
-                )
-            except Exception as exc:
-                print(f"[WARN] {subset} breakdown eval failed: {exc}")
+            print(f"[EVAL] Running {subset.upper()} breakdown {tag} ({sub_yaml.name}, nms={primary_nms}) ...")
+            sub_res = _run_val(
+                "test",
+                nms=primary_nms,
+                rect=False,
+                eval_imgsz=imgsz,
+                data_yaml=sub_yaml,
+                allow_plots=False,
+            )
+            _assert_finite_metrics(tag, sub_res)
+            summary["evals"][tag] = sub_res
 
     # 3b. Compute anti-noise 3-Class Main Avg (Person/Car/Bicycle, 99.4% of HIT-UAV test instances)
     primary_test = summary["evals"].get("test_o2o_640" if is_e2e_model else "test_nms_640", {})
@@ -288,18 +314,16 @@ def evaluate_checkpoint(
             float(rect_test.get("mAP50", 0.0)) - float(primary_test.get("mAP50", 0.0)), 5
         )
 
-    # 4. Optional ONNX CPU edge latency benchmark
+    # 4. Optional ONNX CPU edge latency benchmark (strict fail-fast when explicitly enabled!)
     if export_onnx_bench:
         summary["onnx_bench"] = {}
         for hw in ((640, 640), (512, 640)):
             key = f"{hw[0]}x{hw[1]}"
-            try:
-                print(f"[BENCH] Exporting & timing ONNX CPU ({key}) ...")
-                summary["onnx_bench"][key] = benchmark_onnx_cpu(
-                    weights_path, imgsz_hw=hw, is_e2e_model=is_e2e_model
-                )
-            except Exception as exc:
-                print(f"[WARN] ONNX CPU benchmark ({key}) failed: {exc}")
+            print(f"[BENCH] Exporting & timing ONNX CPU ({key}) ...")
+            onnx_res = benchmark_onnx_cpu(weights_path, imgsz_hw=hw, is_e2e_model=is_e2e_model)
+            if not math.isfinite(float(onnx_res.get("cpu_latency_ms", float("nan")))):
+                raise ValueError(f"Non-finite ONNX latency for {key}: {onnx_res}")
+            summary["onnx_bench"][key] = onnx_res
 
     tcad_stats = extract_tcad_gate_stats(model.model)
     if tcad_stats:
@@ -382,6 +406,7 @@ def _append_master_csv(summary: Dict[str, Any], csv_path: Path) -> None:
             "rect640x512_mAP50": rect_m.get("mAP50", ""),
             "rect640x512_total_ms": rect_m.get("total_ms", ""),
             "onnx_cpu_512x640_ms": onnx_rect.get("cpu_latency_ms", ""),
+            "weights_sha256": summary.get("weights_sha256", "")[:16],
             "notes": notes_str,
         }
     else:
@@ -417,13 +442,41 @@ def _append_master_csv(summary: Dict[str, Any], csv_path: Path) -> None:
         }
 
     fieldnames = list(row.keys())
-    write_header = not csv_path.exists()
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
+    rows_out: List[Dict[str, Any]] = []
+    upsert_key = (str(row["exp_name"]), str(row["seed"]), str(row["dataset_mode"]))
+    replaced = False
+
+    if csv_path.is_file():
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames and list(reader.fieldnames) != fieldnames:
+                raise ValueError(
+                    f"CSV schema mismatch for {csv_path}: existing={reader.fieldnames} vs new={fieldnames}"
+                )
+            for existing in reader:
+                ekey = (
+                    str(existing.get("exp_name", "")),
+                    str(existing.get("seed", "")),
+                    str(existing.get("dataset_mode", "")),
+                )
+                if ekey == upsert_key:
+                    if not replaced:
+                        rows_out.append(row)
+                        replaced = True
+                    # Drop any pre-existing duplicate rows for the same upsert_key!
+                else:
+                    rows_out.append(existing)
+    if not replaced:
+        rows_out.append(row)
+
+    tmp_csv = csv_path.parent / f".{csv_path.name}.tmp"
+    with tmp_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
-    print(f"[OK] Appended results row to master CSV: {csv_path}")
+        writer.writeheader()
+        writer.writerows(rows_out)
+    os.replace(tmp_csv, csv_path)
+    action = "Updated" if replaced else "Appended"
+    print(f"[OK] {action} results row in master CSV (idempotent): {csv_path}")
 
 
 def _print_compact_table(summary: Dict[str, Any]) -> None:

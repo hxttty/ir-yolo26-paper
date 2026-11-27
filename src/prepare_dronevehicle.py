@@ -1,22 +1,16 @@
 """Deterministic DroneVehicle (RGB + IR) Colab-direct downloader, cropper, HBB converter & Day/Night splitter.
 
-Designed specifically for zero local proxy traffic (runs directly on Colab -> Google Drive cache):
-1. Downloads `val.zip`, `test.zip`, `train.zip` from Hugging Face `McCheng/DroneVehicle`
-   (or restores in ~25s from a cached cropped `dronevehicle_bundle.zip` on Google Drive).
-2. Removes the official 100 px white annotation border (`840x712 -> 640x512`) from BOTH
-   paired RGB (`*img`) and LWIR Infrared (`*imgr`) images while verifying strict 1:1 pairing.
-3. Parses DroneVehicle VOC XML `<polygon>` (and `<bndbox>`) annotations, normalizes known
-   dataset typos (`feright car` / `feright_car` -> `freight_car`), converts OBB -> HBB,
-   shifts by `-100 px`, clamps to `[0, 640] x [0, 512]`, and drops outside/degenerate boxes.
-4. Generates Ultralytics-native directory structure (zero `img2label_paths` hacks):
-   - `<out_root>/dronevehicle_ir/{images,labels}/{train,val,test}`  (canonical IR `*imgr` + `*labelr`)
-   - `<out_root>/dronevehicle_rgb/{images,labels}/{train,val,test}` (paired RGB `*img` + `*label`)
-   - `<out_root>/dronevehicle_ir.yaml`          (primary IR benchmark & Track B student target)
-   - `<out_root>/dronevehicle_rgb.yaml`         (auxiliary RGB teacher benchmark)
-   - `<out_root>/dronevehicle_ir_day.yaml`      (Daytime subset evaluation: RGB luminance >= thresh)
-   - `<out_root>/dronevehicle_ir_night.yaml`    (Nighttime/Dark subset evaluation: RGB luminance < thresh)
-5. Saves side-by-side `(RGB | IR)` sanity visualizations (3 daytime + 3 nighttime) and full
-   illumination & class statistics (`illumination_stats.json`) for paper tables.
+Hardened against partial downloads, corrupt zips/XMLs, failed image writes, and stale caches:
+1. Downloads `val.zip`, `test.zip`, `train.zip` from `McCheng/DroneVehicle` to `.part` files using
+   `curl --fail -L -C -`, verifies exact `Content-Length` + ZIP readability before atomic rename.
+2. Checks local SSD free space before extracting into an isolated temp directory; NEVER skips
+   extraction based on a non-empty partial directory.
+3. Requires ALL FOUR source folders (`*img`, `*imgr`, `*label`, `*labelr`), strict 1:1 pairing
+   (`ir_stems == rgb_stems`), valid XML parsing (failing fast on missing/corrupt XML while allowing
+   legitimate empty `<annotation>`), identical post-crop IR/RGB geometry, and verified `cv2.imwrite`.
+4. Writes canonical `dv_manifest.json` and only publishes `dronevehicle_bundle.zip` via atomic
+   rename inside `bundle_path.parent` after all splits succeed. Fast-path restore verifies the
+   full manifest and always rewrites YAML `path`/`rgb_root` to match `out_root.resolve()`.
 """
 
 from __future__ import annotations
@@ -26,7 +20,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -67,21 +60,46 @@ IGNORE_LABELS = {"*", "ignore", "ignored", "dontcare", "dont_care", ""}
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
+def _remote_content_length(url: str) -> Optional[int]:
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            cl = r.headers.get("Content-Length")
+            return int(cl) if cl and cl.isdigit() else None
+    except Exception:
+        return None
+
+
+def _is_valid_zip(path: Path, expected_size: Optional[int] = None) -> bool:
+    if not path.is_file():
+        return False
+    if expected_size is not None and path.stat().st_size != expected_size:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return len(zf.infolist()) > 0
+    except Exception:
+        return False
+
+
 def _download_hf_file(filename: str, dst_path: Path) -> Path:
-    """Download a split zip directly inside Colab using huggingface_hub or resumable curl."""
+    """Resumable atomic download to `.part` with `curl --fail`, size check, and ZIP verification."""
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    if dst_path.is_file() and dst_path.stat().st_size > 10_000_000:
-        print(f"[CACHE] Reusing existing local archive: {dst_path} ({dst_path.stat().st_size / 1e9:.2f} GB)")
+    url = f"{HF_BASE_URL}/{filename}"
+    expected_size = _remote_content_length(url)
+
+    if _is_valid_zip(dst_path, expected_size=expected_size):
+        print(f"[CACHE] Verified existing archive: {dst_path} ({dst_path.stat().st_size / 1e9:.2f} GB)")
         return dst_path
 
-    url = f"{HF_BASE_URL}/{filename}"
-    print(f"[DOWNLOAD] Fetching {filename} from {url} ...")
+    part_path = dst_path.with_suffix(dst_path.suffix + ".part")
+    print(f"[DOWNLOAD] Fetching {filename} from {url} (expected={expected_size or 'unknown'} B) ...")
 
-    # Prefer curl with resume (`-C -`) and retries; super fast and reliable on Colab
     curl_bin = shutil.which("curl")
     if curl_bin:
         cmd = [
             curl_bin,
+            "--fail",
             "-L",
             "-C",
             "-",
@@ -92,16 +110,22 @@ def _download_hf_file(filename: str, dst_path: Path) -> Path:
             "--connect-timeout",
             "30",
             "-o",
-            str(dst_path),
+            str(part_path),
             url,
         ]
         print(f"[CMD] {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
-        return dst_path
+    else:
+        with urllib.request.urlopen(url, timeout=60) as resp, part_path.open("wb") as out_f:
+            shutil.copyfileobj(resp, out_f, length=4 * 1024 * 1024)
 
-    # Fallback: urllib streaming download
-    with urllib.request.urlopen(url, timeout=60) as resp, dst_path.open("wb") as out_f:
-        shutil.copyfileobj(resp, out_f, length=4 * 1024 * 1024)
+    if not _is_valid_zip(part_path, expected_size=expected_size):
+        actual = part_path.stat().st_size if part_path.is_file() else 0
+        raise RuntimeError(
+            f"Downloaded archive '{part_path}' failed integrity check "
+            f"(actual={actual} B vs expected={expected_size} B)!"
+        )
+    os.replace(part_path, dst_path)
     return dst_path
 
 
@@ -114,14 +138,17 @@ def _parse_dv_xml_to_hbb(
     unknown_counter: Counter,
     class_counter: Counter,
 ) -> List[Tuple[int, float, float, float, float]]:
-    """Parse DroneVehicle VOC XML (polygon or bndbox), shift by `-pad`, convert to normalized YOLO HBB."""
+    """Parse DroneVehicle VOC XML (polygon or bndbox), shift by `-pad`, convert to normalized YOLO HBB.
+
+    Fails fast on missing or corrupt XML; legitimate empty `<annotation>` with 0 objects returns `[]`.
+    """
     if not xml_path.is_file():
-        return []
+        raise FileNotFoundError(f"Missing DroneVehicle XML annotation: {xml_path}")
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
-    except Exception:
-        return []
+    except ET.ParseError as exc:
+        raise ValueError(f"Corrupt DroneVehicle XML annotation '{xml_path}': {exc}") from exc
 
     boxes: List[Tuple[int, float, float, float, float]] = []
     for obj in root.findall("object"):
@@ -144,21 +171,17 @@ def _parse_dv_xml_to_hbb(
                 xe = poly.find(f"x{k}")
                 ye = poly.find(f"y{k}")
                 if xe is not None and ye is not None and xe.text and ye.text:
-                    try:
-                        xs.append(float(xe.text) - pad)
-                        ys.append(float(ye.text) - pad)
-                    except ValueError:
-                        pass
+                    xs.append(float(xe.text) - pad)
+                    ys.append(float(ye.text) - pad)
         if len(xs) < 2:
             bnd = obj.find("bndbox")
             if bnd is not None:
-                try:
-                    xs = [float(bnd.findtext("xmin", "0")) - pad, float(bnd.findtext("xmax", "0")) - pad]
-                    ys = [float(bnd.findtext("ymin", "0")) - pad, float(bnd.findtext("ymax", "0")) - pad]
-                except ValueError:
-                    continue
+                xs = [float(bnd.findtext("xmin", "0")) - pad, float(bnd.findtext("xmax", "0")) - pad]
+                ys = [float(bnd.findtext("ymin", "0")) - pad, float(bnd.findtext("ymax", "0")) - pad]
         if len(xs) < 2 or len(ys) < 2:
-            continue
+            raise ValueError(
+                f"Malformed XML {xml_path}: known class '{raw_name}' missing valid <polygon>/<bndbox> coordinates!"
+            )
 
         raw_x1, raw_x2 = min(xs), max(xs)
         raw_y1, raw_y2 = min(ys), max(ys)
@@ -172,7 +195,6 @@ def _parse_dv_xml_to_hbb(
         bh = y2 - y1
         if bw <= 1.5 or bh <= 1.5:
             continue
-        # Drop objects almost entirely located inside the cropped 100 px white border
         if (bw * bh) / raw_area < 0.10:
             continue
 
@@ -189,7 +211,7 @@ def _write_yolo_txt(path: Path, boxes: List[Tuple[int, float, float, float, floa
 
 
 def _find_split_subdirs(extract_dir: Path, split: str) -> Tuple[Path, Path, Path, Path]:
-    """Locate (rgb_img_dir, ir_img_dir, rgb_lbl_dir, ir_lbl_dir) inside extracted split archive."""
+    """Locate ALL FOUR required subdirs (rgb_img, ir_img, rgb_lbl, ir_lbl); fail fast if any is missing."""
     all_dirs = [p for p in extract_dir.rglob("*") if p.is_dir()]
     name_map = {p.name.lower(): p for p in all_dirs}
 
@@ -204,14 +226,12 @@ def _find_split_subdirs(extract_dir: Path, split: str) -> Tuple[Path, Path, Path
     rgb_lbl = _pick([f"{split}label", "labels_rgb", "label"])
     ir_lbl = _pick([f"{split}labelr", "labels_ir", "labelr"])
 
-    if not all([rgb_img, ir_img, ir_lbl]):
+    if not all([rgb_img, ir_img, rgb_lbl, ir_lbl]):
         found = sorted(str(p.relative_to(extract_dir)) for p in all_dirs)
         raise FileNotFoundError(
-            f"Could not locate DroneVehicle '{split}' subdirs in {extract_dir}. "
-            f"Found: {found[:30]}"
+            f"DroneVehicle '{split}' requires ALL 4 subdirs (rgb_img, ir_img, rgb_lbl, ir_lbl); "
+            f"got rgb_img={rgb_img}, ir_img={ir_img}, rgb_lbl={rgb_lbl}, ir_lbl={ir_lbl}. Found: {found[:30]}"
         )
-    if rgb_lbl is None:
-        rgb_lbl = ir_lbl
     return rgb_img, ir_img, rgb_lbl, ir_lbl  # type: ignore[return-value]
 
 
@@ -238,18 +258,28 @@ def _process_single_pair(
     out_ir_lbl: Path,
     out_rgb_lbl: Path,
     jpeg_quality: int,
-) -> Optional[Dict[str, object]]:
+) -> Dict[str, object]:
     ir_im = cv2.imread(str(ir_src), cv2.IMREAD_COLOR)
     rgb_im = cv2.imread(str(rgb_src), cv2.IMREAD_COLOR)
-    if ir_im is None or rgb_im is None:
-        return None
+    if ir_im is None:
+        raise RuntimeError(f"Failed to read IR image: {ir_src}")
+    if rgb_im is None:
+        raise RuntimeError(f"Failed to read RGB image: {rgb_src}")
 
     ir_crop, pad_ir = _crop_border_if_needed(ir_im, border=100)
     rgb_crop, pad_rgb = _crop_border_if_needed(rgb_im, border=100)
 
-    # Guarantee identical HxW between paired IR & RGB (handles rare edge cases cleanly)
     h_ir, w_ir = ir_crop.shape[:2]
-    if rgb_crop.shape[:2] != (h_ir, w_ir):
+    h_rgb, w_rgb = rgb_crop.shape[:2]
+    if (h_rgb, w_rgb) != (h_ir, w_ir):
+        # Preserve original RGB dimensions for accurate normalized coordinate scaling if resized,
+        # but fail if aspect ratio diverges significantly (indicating mismatched/corrupt crop).
+        ar_ir = w_ir / float(max(h_ir, 1))
+        ar_rgb = w_rgb / float(max(h_rgb, 1))
+        if abs(ar_ir - ar_rgb) > 0.05:
+            raise ValueError(
+                f"RGB/IR aspect mismatch on '{stem}': IR={w_ir}x{h_ir} vs RGB={w_rgb}x{h_rgb}"
+            )
         rgb_crop = cv2.resize(rgb_crop, (w_ir, h_ir), interpolation=cv2.INTER_LINEAR)
 
     # Compute exact RGB illumination stats BEFORE JPEG re-save (normalized [0, 1])
@@ -258,8 +288,10 @@ def _process_single_pair(
     lum_std = float(rgb_f.std())
 
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
-    cv2.imwrite(str(out_ir_img), ir_crop, encode_params)
-    cv2.imwrite(str(out_rgb_img), rgb_crop, encode_params)
+    if not cv2.imwrite(str(out_ir_img), ir_crop, encode_params):
+        raise OSError(f"cv2.imwrite failed for IR image: {out_ir_img}")
+    if not cv2.imwrite(str(out_rgb_img), rgb_crop, encode_params):
+        raise OSError(f"cv2.imwrite failed for RGB image: {out_rgb_img}")
 
     unk_ir: Counter = Counter()
     cls_ir: Counter = Counter()
@@ -269,8 +301,9 @@ def _process_single_pair(
     ir_boxes = _parse_dv_xml_to_hbb(
         ir_xml, pad=pad_ir, out_w=w_ir, out_h=h_ir, unknown_counter=unk_ir, class_counter=cls_ir
     )
+    # Use pre-resize `(w_rgb, h_rgb)` so normalized RGB labels stay geometrically exact!
     rgb_boxes = _parse_dv_xml_to_hbb(
-        rgb_xml, pad=pad_rgb, out_w=w_ir, out_h=h_ir, unknown_counter=unk_rgb, class_counter=cls_rgb
+        rgb_xml, pad=pad_rgb, out_w=w_rgb, out_h=h_rgb, unknown_counter=unk_rgb, class_counter=cls_rgb
     )
     _write_yolo_txt(out_ir_lbl, ir_boxes)
     _write_yolo_txt(out_rgb_lbl, rgb_boxes)
@@ -349,8 +382,131 @@ def _save_sanity_visuals(
             2,
         )
         pair = np.concatenate([rgb_v, ir_v], axis=1)
-        cv2.imwrite(str(vis_dir / f"dv_{tag}_{stem}.jpg"), pair)
+        if not cv2.imwrite(str(vis_dir / f"dv_{tag}_{stem}.jpg"), pair):
+            raise OSError(f"Failed writing sanity visual: {vis_dir / f'dv_{tag}_{stem}.jpg'}")
     print(f"[OK] Saved {len(chosen)} RGB|IR DroneVehicle sanity visuals -> {vis_dir}")
+
+
+def _rewrite_dv_yamls(out_root: Path) -> None:
+    ir_root = (out_root / "dronevehicle_ir").resolve()
+    rgb_root = (out_root / "dronevehicle_rgb").resolve()
+    names_dict = {i: n for i, n in enumerate(CLASS_NAMES)}
+
+    def _dump(path: Path, payload: Dict[str, object]) -> None:
+        path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    _dump(
+        out_root / "dronevehicle_ir.yaml",
+        {
+            "path": str(ir_root),
+            "rgb_root": str(rgb_root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": len(CLASS_NAMES),
+            "names": names_dict,
+        },
+    )
+    _dump(
+        out_root / "dronevehicle_rgb.yaml",
+        {
+            "path": str(rgb_root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": len(CLASS_NAMES),
+            "names": names_dict,
+        },
+    )
+    for tag in ("day", "night"):
+        _dump(
+            out_root / f"dronevehicle_ir_{tag}.yaml",
+            {
+                "path": str(ir_root),
+                "train": "images/train",
+                "val": f"val_{tag}.txt",
+                "test": f"test_{tag}.txt",
+                "nc": len(CLASS_NAMES),
+                "names": names_dict,
+            },
+        )
+        _dump(
+            out_root / f"dronevehicle_rgb_{tag}.yaml",
+            {
+                "path": str(rgb_root),
+                "train": "images/train",
+                "val": f"val_{tag}.txt",
+                "test": f"test_{tag}.txt",
+                "nc": len(CLASS_NAMES),
+                "names": names_dict,
+            },
+        )
+
+
+def verify_prepared_dronevehicle(out_root: Path) -> Tuple[bool, str]:
+    """Verify full dual-modality manifest, YAML paths, exact stem sets, and Day/Night partitions."""
+    manifest_p = out_root / "dronevehicle_ir" / "dv_manifest.json"
+    if not manifest_p.is_file():
+        return False, f"Missing manifest {manifest_p}"
+    try:
+        manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"Unreadable manifest: {exc}"
+
+    req_yamls = [
+        "dronevehicle_ir.yaml",
+        "dronevehicle_rgb.yaml",
+        "dronevehicle_ir_day.yaml",
+        "dronevehicle_ir_night.yaml",
+        "dronevehicle_rgb_day.yaml",
+        "dronevehicle_rgb_night.yaml",
+    ]
+    for y in req_yamls:
+        yp = out_root / y
+        if not yp.is_file():
+            return False, f"Missing YAML {y}"
+        try:
+            ydata = yaml.safe_load(yp.read_text(encoding="utf-8")) or {}
+            if not Path(str(ydata.get("path", ""))).is_dir():
+                return False, f"YAML {y} has non-existent path={ydata.get('path')}"
+            if y == "dronevehicle_ir.yaml" and not Path(str(ydata.get("rgb_root", ""))).is_dir():
+                return False, f"YAML {y} has non-existent rgb_root={ydata.get('rgb_root')}"
+        except Exception as exc:
+            return False, f"Unreadable YAML {y}: {exc}"
+
+    splits_meta = manifest.get("splits", {})
+    for sp in ("train", "val", "test"):
+        sp_meta = splits_meta.get(sp, {}) or {}
+        exp_n = int(sp_meta.get("pairs", 0))
+        if exp_n <= 0:
+            return False, f"Manifest has invalid count for split '{sp}': {exp_n}"
+        ir_img_stems = {p.stem for p in (out_root / "dronevehicle_ir" / "images" / sp).glob("*.jpg")}
+        ir_lbl_stems = {p.stem for p in (out_root / "dronevehicle_ir" / "labels" / sp).glob("*.txt")}
+        rgb_img_stems = {p.stem for p in (out_root / "dronevehicle_rgb" / "images" / sp).glob("*.jpg")}
+        rgb_lbl_stems = {p.stem for p in (out_root / "dronevehicle_rgb" / "labels" / sp).glob("*.txt")}
+        if len(ir_img_stems) != exp_n or not (ir_img_stems == ir_lbl_stems == rgb_img_stems == rgb_lbl_stems):
+            return (
+                False,
+                f"Stem/count mismatch in '{sp}': expected={exp_n}, ir_img={len(ir_img_stems)}, "
+                f"ir_lbl={len(ir_lbl_stems)}, rgb_img={len(rgb_img_stems)}, rgb_lbl={len(rgb_lbl_stems)}",
+            )
+        for mod in ("dronevehicle_ir", "dronevehicle_rgb"):
+            day_p = out_root / mod / f"{sp}_day.txt"
+            ngt_p = out_root / mod / f"{sp}_night.txt"
+            if not day_p.is_file() or not ngt_p.is_file():
+                return False, f"Missing Day/Night split list under {mod}/{sp}"
+            day_stems = {Path(line.strip()).stem for line in day_p.read_text(encoding="utf-8").splitlines() if line.strip()}
+            ngt_stems = {Path(line.strip()).stem for line in ngt_p.read_text(encoding="utf-8").splitlines() if line.strip()}
+            if not day_stems or not ngt_stems:
+                return False, f"Empty Day ({len(day_stems)}) or Night ({len(ngt_stems)}) list in {mod}/{sp}"
+            if day_stems & ngt_stems:
+                return False, f"Overlapping Day/Night stems in {mod}/{sp}: {len(day_stems & ngt_stems)}"
+            if (day_stems | ngt_stems) != ir_img_stems:
+                return (
+                    False,
+                    f"Day∪Night stems ({len(day_stems | ngt_stems)}) != image stems ({len(ir_img_stems)}) in {mod}/{sp}",
+                )
+    return True, f"Verified complete DroneVehicle manifest ({ {k: v['pairs'] for k, v in splits_meta.items()} })"
 
 
 def _write_yamls_and_split_lists(
@@ -369,7 +525,7 @@ def _write_yamls_and_split_lists(
 
     for split, recs in split_records.items():
         if not recs:
-            continue
+            raise RuntimeError(f"Empty records for split '{split}'")
         day_ir: List[str] = []
         night_ir: List[str] = []
         day_rgb: List[str] = []
@@ -378,27 +534,32 @@ def _write_yamls_and_split_lists(
         lum_vals = [float(r["lum_mean"]) for r in recs]
         for r in recs:
             stem = str(r["stem"])
-            ir_rel = f"./images/{split}/{stem}.jpg"
-            rgb_rel = f"./images/{split}/{stem}.jpg"
+            rel = f"./images/{split}/{stem}.jpg"
             if float(r["lum_mean"]) >= day_lum_thresh:
-                day_ir.append(ir_rel)
-                day_rgb.append(rgb_rel)
+                day_ir.append(rel)
+                day_rgb.append(rel)
             else:
-                night_ir.append(ir_rel)
-                night_rgb.append(rgb_rel)
+                night_ir.append(rel)
+                night_rgb.append(rel)
 
-        (ir_root / f"{split}_day.txt").write_text("\n".join(day_ir) + ("\n" if day_ir else ""), encoding="utf-8")
-        (ir_root / f"{split}_night.txt").write_text("\n".join(night_ir) + ("\n" if night_ir else ""), encoding="utf-8")
-        (rgb_root / f"{split}_day.txt").write_text("\n".join(day_rgb) + ("\n" if day_rgb else ""), encoding="utf-8")
-        (rgb_root / f"{split}_night.txt").write_text("\n".join(night_rgb) + ("\n" if night_rgb else ""), encoding="utf-8")
+        if not day_ir or not night_ir:
+            raise RuntimeError(
+                f"Split '{split}' produced empty Day ({len(day_ir)}) or Night ({len(night_ir)}) subset "
+                f"at day_lum_thresh={day_lum_thresh}!"
+            )
+
+        (ir_root / f"{split}_day.txt").write_text("\n".join(day_ir) + "\n", encoding="utf-8")
+        (ir_root / f"{split}_night.txt").write_text("\n".join(night_ir) + "\n", encoding="utf-8")
+        (rgb_root / f"{split}_day.txt").write_text("\n".join(day_rgb) + "\n", encoding="utf-8")
+        (rgb_root / f"{split}_night.txt").write_text("\n".join(night_rgb) + "\n", encoding="utf-8")
 
         cls_ir_tot: Counter = Counter()
         cls_rgb_tot: Counter = Counter()
         unk_tot: Counter = Counter()
         for r in recs:
-            cls_ir_tot.update(r["cls_ir"])   # type: ignore[arg-type]
-            cls_rgb_tot.update(r["cls_rgb"]) # type: ignore[arg-type]
-            unk_tot.update(r["unk"])         # type: ignore[arg-type]
+            cls_ir_tot.update(r["cls_ir"])    # type: ignore[arg-type]
+            cls_rgb_tot.update(r["cls_rgb"])  # type: ignore[arg-type]
+            unk_tot.update(r["unk"])          # type: ignore[arg-type]
 
         stats["splits"][split] = {
             "pairs": len(recs),
@@ -415,123 +576,93 @@ def _write_yamls_and_split_lists(
             "unknown_skipped": dict(unk_tot),
         }
 
-    names_dict = {i: n for i, n in enumerate(CLASS_NAMES)}
-
-    def _dump_yaml(path: Path, payload: Dict[str, object]) -> None:
-        path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-
-    # 1. Primary IR dataset YAML (with paired `rgb_root` metadata for Track B!)
-    _dump_yaml(
-        out_root / "dronevehicle_ir.yaml",
-        {
-            "path": str(ir_root.resolve()),
-            "rgb_root": str(rgb_root.resolve()),
-            "train": "images/train",
-            "val": "images/val",
-            "test": "images/test",
-            "nc": len(CLASS_NAMES),
-            "names": names_dict,
-        },
-    )
-    # 2. Auxiliary RGB Teacher dataset YAML
-    _dump_yaml(
-        out_root / "dronevehicle_rgb.yaml",
-        {
-            "path": str(rgb_root.resolve()),
-            "train": "images/train",
-            "val": "images/val",
-            "test": "images/test",
-            "nc": len(CLASS_NAMES),
-            "names": names_dict,
-        },
-    )
-    # 3. Daytime & Nighttime IR evaluation YAMLs (zero image duplication!)
-    for tag in ("day", "night"):
-        _dump_yaml(
-            out_root / f"dronevehicle_ir_{tag}.yaml",
-            {
-                "path": str(ir_root.resolve()),
-                "train": "images/train",
-                "val": f"val_{tag}.txt",
-                "test": f"test_{tag}.txt",
-                "nc": len(CLASS_NAMES),
-                "names": names_dict,
-            },
-        )
-        _dump_yaml(
-            out_root / f"dronevehicle_rgb_{tag}.yaml",
-            {
-                "path": str(rgb_root.resolve()),
-                "train": "images/train",
-                "val": f"val_{tag}.txt",
-                "test": f"test_{tag}.txt",
-                "nc": len(CLASS_NAMES),
-                "names": names_dict,
-            },
-        )
-
+    _rewrite_dv_yamls(out_root)
     stats_path = ir_root / "illumination_stats.json"
     stats_path.write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[OK] Wrote DroneVehicle YAMLs + Day/Night splits + stats -> {stats_path}")
+    (ir_root / "dv_manifest.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[OK] Wrote DroneVehicle YAMLs + Day/Night splits + manifest -> {stats_path}")
     return stats
 
 
 def _bundle_to_drive(out_root: Path, bundle_path: Path) -> None:
-    """Create a fast uncompressed/low-compression zip bundle on Google Drive for rapid Colab restores."""
+    """Pack verified dataset directly into `bundle_path.parent` (no extra local SSD copy) + atomic replace."""
+    ok, msg = verify_prepared_dronevehicle(out_root)
+    if not ok:
+        raise RuntimeError(f"Refusing to bundle incomplete DroneVehicle dataset: {msg}")
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_zip = out_root / "_dv_bundle_tmp.zip"
-    print(f"[BUNDLE] Packing cropped DroneVehicle -> {bundle_path} (STORED mode for max speed) ...")
+    tmp_zip = bundle_path.parent / f".{bundle_path.name}.tmp"
+    print(f"[BUNDLE] Packing verified DroneVehicle -> {bundle_path} (ZIP_STORED) ...")
     t0 = time.perf_counter()
-    # JPEGs are already compressed; ZIP_STORED is 10x faster to pack & unpack!
     with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_STORED) as zf:
         for sub in ("dronevehicle_ir", "dronevehicle_rgb"):
             root_sub = out_root / sub
-            if not root_sub.is_dir():
-                continue
             for p in root_sub.rglob("*"):
                 if p.is_file() and not p.name.endswith(".cache"):
                     zf.write(p, arcname=str(p.relative_to(out_root)))
         for y in out_root.glob("dronevehicle_*.yaml"):
             zf.write(y, arcname=y.name)
-    shutil.move(str(tmp_zip), str(bundle_path))
+    if not _is_valid_zip(tmp_zip):
+        raise RuntimeError(f"Packed bundle failed ZIP validation: {tmp_zip}")
+    os.replace(tmp_zip, bundle_path)
     print(
-        f"[OK] Saved DroneVehicle bundle ({bundle_path.stat().st_size / 1e9:.2f} GB) "
+        f"[OK] Saved verified DroneVehicle bundle ({bundle_path.stat().st_size / 1e9:.2f} GB) "
         f"in {time.perf_counter() - t0:.1f}s -> {bundle_path}"
     )
 
 
 def _restore_from_bundle(out_root: Path, bundle_path: Path) -> bool:
+    # 1. Fast path: verify full manifest locally, rewrite YAML paths, and repair missing Drive bundle if needed!
+    ok_local, msg_local = verify_prepared_dronevehicle(out_root)
+    if ok_local:
+        _rewrite_dv_yamls(out_root)
+        if not _is_valid_zip(bundle_path):
+            print(f"[REPAIR] Local DroneVehicle verified, rebuilding missing/invalid Drive bundle -> {bundle_path}")
+            _bundle_to_drive(out_root, bundle_path)
+        print(f"[FAST] {msg_local}")
+        return True
+
     if not bundle_path.is_file():
         return False
-    ir_yaml = out_root / "dronevehicle_ir.yaml"
-    rgb_yaml = out_root / "dronevehicle_rgb.yaml"
-    if ir_yaml.is_file() and rgb_yaml.is_file() and (out_root / "dronevehicle_ir" / "images" / "train").is_dir():
-        n_tr = len(list((out_root / "dronevehicle_ir" / "images" / "train").glob("*.jpg")))
-        if n_tr > 1000:
-            print(f"[FAST] DroneVehicle already unpacked at {out_root} ({n_tr} train IR images).")
-            return True
 
     print(f"[RESTORE] Unpacking cached DroneVehicle bundle from Drive: {bundle_path} ...")
     t0 = time.perf_counter()
-    out_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(bundle_path, "r") as zf:
-        zf.extractall(out_root)
+    stage_restore = out_root / "_dv_restore_tmp"
+    if stage_restore.exists():
+        shutil.rmtree(stage_restore)
+    stage_restore.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(bundle_path, "r") as zf:
+            need_bytes = sum(i.file_size for i in zf.infolist())
+            free_bytes = shutil.disk_usage(out_root).free
+            if free_bytes < need_bytes + 512 * 1024 * 1024:
+                raise OSError(
+                    f"Insufficient SSD space to unpack DroneVehicle bundle: "
+                    f"need {need_bytes/1e9:.2f} GB, free {free_bytes/1e9:.2f} GB"
+                )
+            zf.extractall(stage_restore)
+        _rewrite_dv_yamls(stage_restore)
+        ok_after, msg_after = verify_prepared_dronevehicle(stage_restore)
+        if not ok_after:
+            raise RuntimeError(f"Restored Drive bundle failed manifest verification: {msg_after}")
+    except Exception as exc:
+        # Quarantine corrupt/legacy bundle so we fall back cleanly to fresh preparation instead of looping forever!
+        shutil.rmtree(stage_restore, ignore_errors=True)
+        quarantine = bundle_path.with_name(f"{bundle_path.name}.quarantine_{int(time.time())}")
+        print(f"[WARN] Cached Drive bundle {bundle_path} is invalid/legacy ({exc}); quarantining -> {quarantine.name}")
+        try:
+            bundle_path.rename(quarantine)
+        except Exception:
+            pass
+        return False
 
-    # Rewrite YAML `path` fields so they point cleanly to `out_root.resolve()`
-    ir_root = out_root / "dronevehicle_ir"
-    rgb_root = out_root / "dronevehicle_rgb"
-    for y_path in out_root.glob("dronevehicle_*.yaml"):
-        cfg = yaml.safe_load(y_path.read_text(encoding="utf-8"))
-        if isinstance(cfg, dict):
-            if "_rgb" in y_path.name:
-                cfg["path"] = str(rgb_root.resolve())
-            else:
-                cfg["path"] = str(ir_root.resolve())
-                if "rgb_root" in cfg:
-                    cfg["rgb_root"] = str(rgb_root.resolve())
-            y_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-
-    print(f"[OK] Restored DroneVehicle in {time.perf_counter() - t0:.1f}s -> {out_root}")
+    for sub in ("dronevehicle_ir", "dronevehicle_rgb"):
+        dst_sub = out_root / sub
+        if dst_sub.exists():
+            shutil.rmtree(dst_sub)
+        shutil.move(str(stage_restore / sub), str(dst_sub))
+    shutil.rmtree(stage_restore, ignore_errors=True)
+    _rewrite_dv_yamls(out_root)
+    print(f"[OK] Restored & verified DroneVehicle in {time.perf_counter() - t0:.1f}s -> {out_root}")
     return True
 
 
@@ -551,12 +682,23 @@ def prepare_dronevehicle(
     if drive_bundle is not None and _restore_from_bundle(out_root, drive_bundle):
         stats_p = out_root / "dronevehicle_ir" / "illumination_stats.json"
         return json.loads(stats_p.read_text(encoding="utf-8")) if stats_p.is_file() else {}
+    elif drive_bundle is None:
+        ok_local, msg_local = verify_prepared_dronevehicle(out_root)
+        if ok_local:
+            _rewrite_dv_yamls(out_root)
+            print(f"[FAST] {msg_local}")
+            stats_p = out_root / "dronevehicle_ir" / "illumination_stats.json"
+            return json.loads(stats_p.read_text(encoding="utf-8")) if stats_p.is_file() else {}
 
     work_raw = raw_dir if raw_dir is not None else (out_root / "_dv_raw_tmp")
     work_raw.mkdir(parents=True, exist_ok=True)
 
-    ir_root = out_root / "dronevehicle_ir"
-    rgb_root = out_root / "dronevehicle_rgb"
+    # Build into isolated staging dirs; publish atomically only after ALL splits pass 100%!
+    stage_root = out_root / "_dv_stage_tmp"
+    if stage_root.exists():
+        shutil.rmtree(stage_root)
+    ir_root = stage_root / "dronevehicle_ir"
+    rgb_root = stage_root / "dronevehicle_rgb"
     split_records: Dict[str, List[Dict[str, object]]] = {}
 
     for split in splits:
@@ -566,26 +708,40 @@ def prepare_dronevehicle(
         print("=" * 72)
 
         extract_dir = work_raw / f"extracted_{split}"
-        zip_path = work_raw / f"{split}.zip"
-        if not extract_dir.is_dir() or not any(extract_dir.iterdir()):
+        if raw_dir is None:
+            # Always extract freshly into clean dir so partial crashed extractions are never trusted
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+            zip_path = work_raw / f"{split}.zip"
             _download_hf_file(f"{split}.zip", zip_path)
-            print(f"[UNZIP] Extracting {zip_path.name} -> {extract_dir} ...")
-            extract_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(zip_path, "r") as zf:
+                need_bytes = sum(i.file_size for i in zf.infolist())
+                free_bytes = shutil.disk_usage(work_raw).free
+                if free_bytes < need_bytes + 1024 * 1024 * 1024:
+                    raise OSError(
+                        f"Insufficient SSD space to extract {zip_path.name}: "
+                        f"need {need_bytes/1e9:.2f} GB, free {free_bytes/1e9:.2f} GB"
+                    )
+                print(f"[UNZIP] Extracting {zip_path.name} ({need_bytes/1e9:.2f} GB) -> {extract_dir} ...")
+                extract_dir.mkdir(parents=True, exist_ok=True)
                 zf.extractall(extract_dir)
-            if not keep_raw and raw_dir is None:
+            if not keep_raw:
                 zip_path.unlink(missing_ok=True)
+        else:
+            extract_dir = raw_dir
 
         rgb_img_dir, ir_img_dir, rgb_lbl_dir, ir_lbl_dir = _find_split_subdirs(extract_dir, split)
         ir_files = {p.stem: p for p in ir_img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS}
         rgb_files = {p.stem: p for p in rgb_img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS}
-        common_stems = sorted(set(ir_files.keys()) & set(rgb_files.keys()))
-        print(
-            f"[INFO] {split}: found {len(ir_files)} IR, {len(rgb_files)} RGB -> "
-            f"{len(common_stems)} strict 1:1 paired frames."
-        )
-        if not common_stems:
-            raise RuntimeError(f"Zero matched RGB-IR pairs found for DroneVehicle split '{split}'!")
+        if not ir_files or set(ir_files.keys()) != set(rgb_files.keys()):
+            only_ir = len(set(ir_files.keys()) - set(rgb_files.keys()))
+            only_rgb = len(set(rgb_files.keys()) - set(ir_files.keys()))
+            raise RuntimeError(
+                f"DroneVehicle '{split}' IR/RGB stem mismatch! "
+                f"IR={len(ir_files)}, RGB={len(rgb_files)}, only_ir={only_ir}, only_rgb={only_rgb}"
+            )
+        common_stems = sorted(ir_files.keys())
+        print(f"[INFO] {split}: verified strict 1:1 pairing across {len(common_stems)} RGB-IR frames.")
 
         out_ir_img_dir = ir_root / "images" / split
         out_ir_lbl_dir = ir_root / "labels" / split
@@ -594,7 +750,7 @@ def prepare_dronevehicle(
         for d in (out_ir_img_dir, out_ir_lbl_dir, out_rgb_img_dir, out_rgb_lbl_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        def _worker(st: str) -> Optional[Dict[str, object]]:
+        def _worker(st: str) -> Dict[str, object]:
             return _process_single_pair(
                 st,
                 ir_files[st],
@@ -611,28 +767,45 @@ def prepare_dronevehicle(
         recs: List[Dict[str, object]] = []
         with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
             for idx, res in enumerate(ex.map(_worker, common_stems), 1):
-                if res is not None:
-                    recs.append(res)
+                recs.append(res)
                 if idx % 2000 == 0 or idx == len(common_stems):
                     print(f"  [{split}] processed {idx}/{len(common_stems)} pairs ({time.perf_counter() - t0:.1f}s)")
 
         split_records[split] = recs
 
-        # Free extracted raw files immediately after converting this split to save Colab SSD space!
         if not keep_raw and raw_dir is None:
             shutil.rmtree(extract_dir, ignore_errors=True)
 
     if not keep_raw and raw_dir is None:
         shutil.rmtree(work_raw, ignore_errors=True)
 
-    stats = _write_yamls_and_split_lists(out_root, split_records, day_lum_thresh=day_lum_thresh)
+    stats = _write_yamls_and_split_lists(stage_root, split_records, day_lum_thresh=day_lum_thresh)
+    ok_stage, msg_stage = verify_prepared_dronevehicle(stage_root)
+    if not ok_stage:
+        raise RuntimeError(f"Staged DroneVehicle failed self-verification: {msg_stage}")
+
+    # Atomically publish staged directories into `out_root` and rewrite YAMLs to final paths
+    for sub in ("dronevehicle_ir", "dronevehicle_rgb"):
+        dst_sub = out_root / sub
+        if dst_sub.exists():
+            shutil.rmtree(dst_sub)
+        shutil.move(str(stage_root / sub), str(dst_sub))
+    shutil.rmtree(stage_root, ignore_errors=True)
+    _rewrite_dv_yamls(out_root)
+
     if vis_dir is not None and split_records.get("val"):
-        _save_sanity_visuals(ir_root, rgb_root, split_records["val"], vis_dir, day_lum_thresh)
+        _save_sanity_visuals(
+            out_root / "dronevehicle_ir",
+            out_root / "dronevehicle_rgb",
+            split_records["val"],
+            vis_dir,
+            day_lum_thresh,
+        )
 
     if drive_bundle is not None:
         _bundle_to_drive(out_root, drive_bundle)
 
-    print("\n[SUMMARY] DroneVehicle preparation complete:")
+    print("\n[SUMMARY] DroneVehicle preparation complete & verified:")
     print(json.dumps(stats, indent=2, ensure_ascii=False))
     return stats
 

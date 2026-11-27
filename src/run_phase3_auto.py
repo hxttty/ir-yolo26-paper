@@ -215,6 +215,8 @@ def verify_exported_student_purity(
     work_dir: Path,
     drive_dir: Optional[Path],
     max_params_m: float = 2.55,
+    expected_yaml: str = "yolo26n.yaml",
+    expected_nc: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Verify exported `best.pt` is 100% pure native `YOLO26n` (zero KD / adapter / teacher leakage)."""
     cands = [work_dir / "runs" / exp_dir_name / "weights" / "best.pt"]
@@ -225,7 +227,13 @@ def verify_exported_student_purity(
         return False, f"Exported best.pt missing for {exp_dir_name}"
 
     # 1. Inspect PyTorch zip/pickle byte stream directly for forbidden KD module strings
-    forbidden = (b"kd_yolo26", b"NeckChannelAdapters", b"YOLO26DistillCriterion", b"_FeatureCaptureHook")
+    forbidden = (
+        b"kd_yolo26",
+        b"NeckChannelAdapters",
+        b"YOLO26DistillCriterion",
+        b"_FeatureCaptureHook",
+        b"paired_rgbt_data",
+    )
     try:
         if zipfile.is_zipfile(best_pt):
             with zipfile.ZipFile(best_pt, "r") as zf:
@@ -238,22 +246,80 @@ def verify_exported_student_purity(
     except Exception as exc:
         return False, f"Failed scanning {best_pt} archive: {exc}"
 
-    # 2. If torch is available (always true on Colab), also verify exact param count & state_dict purity
+    # 2. If torch is available (always true on Colab), also verify exact param count, hook cleanliness & schema
     try:
+        import copy
         import torch
 
         ckpt = torch.load(str(best_pt), map_location="cpu", weights_only=False)
         model_obj = (ckpt.get("ema") or ckpt.get("model")) if isinstance(ckpt, dict) else ckpt
         if model_obj is None:
             return False, f"No model/ema object inside {best_pt}"
+        mod_origin = str(type(model_obj).__module__)
+        if "src.modules" in mod_origin or "kd_yolo26" in mod_origin:
+            return False, f"Non-native model class `{mod_origin}.{type(model_obj).__name__}` in {best_pt}"
+        # Verify zero residual hooks serialized onto any submodule
+        leaked_hooks = [
+            name
+            for name, m in model_obj.named_modules()
+            if getattr(m, "_forward_hooks", None)
+            or getattr(m, "_forward_pre_hooks", None)
+            or getattr(m, "_backward_hooks", None)
+            or getattr(m, "_full_backward_hooks", None)
+        ]
+        if leaked_hooks:
+            return False, f"Residual PyTorch hooks found inside {best_pt}: {leaked_hooks[:5]}"
         sd = model_obj.state_dict()
-        bad_keys = [k for k in sd.keys() if any(w in k.lower() for w in ("adapter", "teacher", "kd_"))]
+        bad_keys = [k for k in sd.keys() if any(w in k.lower() for w in ("adapter", "teacher", "kd_", "aux_"))]
         if bad_keys:
             return False, f"Unexpected KD keys in best.pt state_dict: {bad_keys[:5]}"
         n_params_m = sum(p.numel() for p in model_obj.parameters()) / 1e6
         if n_params_m > max_params_m:
             return False, f"Exported best.pt has {n_params_m:.4f}M params (> {max_params_m:.2f}M)"
-        return True, f"Pure native YOLO26n verified ({n_params_m:.4f}M params, {len(sd)} state_dict tensors, 0 KD refs)"
+
+        # 3. Exact native state_dict key+shape schema comparison against fresh YOLO26n(nc)
+        schema_note = ""
+        if expected_yaml:
+            try:
+                from ultralytics.nn.tasks import DetectionModel
+
+                nc = expected_nc if expected_nc is not None else getattr(model_obj, "nc", None)
+                if nc is None and isinstance(getattr(model_obj, "names", None), dict):
+                    nc = len(model_obj.names)
+                if nc is None or int(nc) <= 0:
+                    return False, f"Cannot verify native schema: missing valid nc on {best_pt}"
+                actual_schema = {k: tuple(v.shape) for k, v in sd.items()}
+                ref_model = DetectionModel(expected_yaml, ch=3, nc=int(nc), verbose=False)
+                unfused_schema = {k: tuple(v.shape) for k, v in ref_model.state_dict().items()}
+                if actual_schema == unfused_schema:
+                    schema_note = f", exact native {expected_yaml}(nc={int(nc)}) schema matched"
+                else:
+                    fused_schema = {k: tuple(v.shape) for k, v in copy.deepcopy(ref_model).fuse().state_dict().items()}
+                    if actual_schema == fused_schema:
+                        schema_note = f", exact fused native {expected_yaml}(nc={int(nc)}) schema matched"
+                    else:
+                        extra = sorted(set(actual_schema) - set(unfused_schema))[:5]
+                        missing = sorted(set(unfused_schema) - set(actual_schema))[:5]
+                        mismatched = [
+                            (k, actual_schema[k], unfused_schema[k])
+                            for k in sorted(set(actual_schema) & set(unfused_schema))
+                            if actual_schema[k] != unfused_schema[k]
+                        ][:5]
+                        return (
+                            False,
+                            f"State_dict schema mismatch vs native {expected_yaml}(nc={int(nc)}): "
+                            f"extra={extra}, missing={missing}, shape_diff={mismatched}",
+                        )
+            except ImportError as exc:
+                if expected_nc is not None:
+                    return False, f"Native schema verification required nc={expected_nc}, but Ultralytics unavailable: {exc}"
+            except Exception as exc:
+                return False, f"Native schema verification failed against {expected_yaml}: {exc}"
+
+        return True, (
+            f"Pure native YOLO26n verified ({n_params_m:.4f}M params, {len(sd)} state_dict tensors, "
+            f"0 KD refs, 0 hooks{schema_note})"
+        )
     except ImportError:
         return True, f"Pickle byte scan clean (0 KD refs in {best_pt.name})"
     except Exception as exc:

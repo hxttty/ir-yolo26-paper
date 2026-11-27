@@ -140,3 +140,11 @@
       - 实现 `src/modules/kd_yolo26.py`（`M1 F-PKD` + `M2 CrossKD-O2O` 绕过 `x_detach` + `M3 QG-CIoU-L1` 无分布双头校准 + 公平对照基线 `CWD` / `Official PR#24894 L2` / `QG-KD 1-IoU` + Track B 夜间熔断与双师优势门控原语）；
       - 适配器独立 `AdamW` 随 `GradScaler` 步进（绕过 `MuSGD` 正交化与 `LambdaLR` 冲突），`deepcopy`/`pickle` 严格剥离教师与适配器（确保导出 `best.pt` 为 100% 纯净 `2.535M / 6.035G / 418 FPS` 原生 `YOLO26n`）；
       - 新增 16 组 Phase 3 完整消融与对比预设（`p3_kd_*_s` / `p3_kd_*_m`）及 Drive 教师权重自动解析器。
+    - **Phase 3 v2 + DroneVehicle Track B 两轮 GPT-6.2-Astra 对抗审计与全量加固（2026-11-27 09:53 JST）**：
+      - 首轮审计揪出 7 P0 + 8 P1 + 4 P2，二轮复检再堵住 3 项续训/完成标记/Gate 边界反例；全部已修复并通过 8 组本机 PyTorch + OpenCV 回归测试：
+        1. `M3` & `Track B` 严格执行精确同目标 `t_fg & s_fg & (t_gt_idx == s_gt_idx)`，独立拆开 O2M/O2O 交集开关且不漂移历史预设；
+        2. 同步配对管线 `paired_rgbt_data.py` 贯穿 `rgb_valid_mask`（关闭混淆的 `erasing=0.0`），夜间熔断改像素掩码矩估计 + `count_include_pad=False`，黑帧+114 灰边与纯灰帧误开率严格 **`0.0000`**；
+        3. Track B 冒烟强锁 `MuSGD` + `batch=32` + `close_mosaic=1` + `oom_retries==0` + 双组 AdamW 真实 `step>=1` + `cm_feat>0` + `cm_cls>0` + `expected_nc=5` 原生权重 schema/hook 校验；
+        4. `train_runner.py` 落地唯一代目录 `gen_ep{N}_{uuid}` + SHA-256 暂存恢复 + `results.csv` 同步 + 配置变更拒绝旧续训 + 缺失 `best.pt` 绝不跳过（同时兼容 HIT-UAV 已完赛的旧版 `p3_kd_v2_full_s`）；
+        5. `prepare_dronevehicle.py` 强制 4 目录/1:1 stem/XML 坐标完整性/互斥全覆盖昼夜清单、`dv_manifest.json`、坏包自动隔离重做、本地快路径自动补打缺失 Drive bundle；
+        6. 所有 DroneVehicle E2E 预设加 `nms=False`（按原生 O2O 选 `best.pt`），Track A/B 对齐相同 IR 蒸馏权重，STAL 高斯前景 16-box 分块（误差 `0.00e+00`）。

@@ -249,6 +249,7 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
             m3_o2o_weight=cfg.kd_m3_o2o_weight,
             m3_box_weight=cfg.kd_m3_box_weight,
             m3_cls_weight=cfg.kd_m3_cls_weight,
+            m3_o2m_intersect_student_fg=cfg.kd_m3_o2m_intersect_student_fg,
             m3_o2o_intersect_student_fg=cfg.kd_m3_o2o_intersect_student_fg,
             use_runner_up_kd=cfg.kd_use_runner_up_kd,
             runner_up_weight=cfg.kd_runner_up_weight,

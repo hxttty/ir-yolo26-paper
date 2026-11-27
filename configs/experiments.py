@@ -158,7 +158,8 @@ class ExperimentConfig:
     kd_m3_o2o_weight: float = 1.0
     kd_m3_box_weight: float = 1.0
     kd_m3_cls_weight: float = 1.0
-    kd_m3_o2o_intersect_student_fg: bool = True  # v2 fix: strictly intersect t_fg & s_fg (zero O2O tug-of-war!)
+    kd_m3_o2m_intersect_student_fg: bool = False  # Keep legacy presets unchanged; set True explicitly in v2/DV!
+    kd_m3_o2o_intersect_student_fg: bool = False  # Keep legacy presets unchanged; set True explicitly in v2/DV!
     kd_use_runner_up_kd: bool = True
     kd_runner_up_weight: float = 0.25
     kd_use_soft_gt_blend: bool = False
@@ -179,17 +180,26 @@ class ExperimentConfig:
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
 
     def apply_smoke_test(self) -> "ExperimentConfig":
-        """Shrink run to a ~60-90s end-to-end sanity check without mutating presets.
+        """Shrink run to a fast end-to-end sanity check without mutating presets.
 
-        For KD runs (`use_kd=True`), preserves the formal `batch` size so Gate 1 verifies
-        exact peak VRAM under the real training batch size.
+        - Preserves formal `batch` size for KD runs so Gate 1 verifies exact peak VRAM & zero OOM retries.
+        - On DroneVehicle KD smoke runs: uses `optimizer="MuSGD"`, `close_mosaic=1` (exercises BOTH Mosaic
+          on Ep 1 AND `close_mosaic` LetterBox on Ep 2!), and `fraction=0.05` (~900 fixed frames = 28 formal
+          `batch=32` batches/epoch covering Day+Night!) so Gate 1 finishes reliably in ~3 minutes.
         """
         if self.smoke_test:
             self.epochs = 2
             self.patience = 2
             if not self.use_kd:
                 self.batch = min(self.batch, 16)
-            self.close_mosaic = 0
+            if self.dataset_name == "dronevehicle":
+                self.close_mosaic = 1
+                self.extra_train_kwargs = dict(self.extra_train_kwargs)
+                self.extra_train_kwargs.setdefault("fraction", 0.05)
+                if self.use_kd:
+                    self.optimizer = "MuSGD"
+            else:
+                self.close_mosaic = 0
             self.save_period = -1
             self.export_onnx_bench = False
             self.exp_name = f"{self.exp_name}_smoke"
@@ -1719,7 +1729,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
     "p3_kd_v2_full_s": ExperimentConfig(
         exp_name="p3_kd_v2_full_s",
         phase="phase3_v2",
-        notes="Phase 3 v2 Full Fixed (n<-s, +0ms): M3 t&s intersection + M2 Ep5 warmup + 40% decay -> 0.0",
+        notes="Phase 3 v2 Full Fixed (n<-s, +0ms): M3 exact GT-ID intersection + M2 Ep5 warmup + 40% decay -> 0.0",
         model_cfg="yolo26n.pt",
         is_e2e_model=True,
         optimizer="auto",
@@ -1742,6 +1752,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.40,
@@ -1779,7 +1790,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
     "p3_kd_v2_m3_s": ExperimentConfig(
         exp_name="p3_kd_v2_m3_s",
         phase="phase3_v2",
-        notes="Phase 3 v2 M3-Only Fixed (n<-s, +0ms): strict t&s intersection QG-CIoU-L1 + 40% decay -> 0.0",
+        notes="Phase 3 v2 M3-Only Fixed (n<-s, +0ms): strict GT-ID intersection QG-CIoU-L1 + 40% decay -> 0.0",
         model_cfg="yolo26n.pt",
         is_e2e_model=True,
         optimizer="auto",
@@ -1795,6 +1806,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_use_m3_qg_head=True,
         kd_lambda_head=0.50,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.40,
@@ -1803,13 +1815,14 @@ PRESETS: Dict[str, ExperimentConfig] = {
     ),
     # =========================================================================
     # Phase 4 — Second Main Battlefield: DroneVehicle (17,990 train / 8,980 test, 5 classes)
-    #   Track A: Single-Modal IR -> IR (+0.00 ms)
-    #   Track B: Night-Safe Decoupled Dual-Teacher Privileged Cross-Modal (RGB+IR -> IR-only, +0.00 ms)
+    #   All DroneVehicle E2E presets pass `nms=False` so in-training `best.pt` selects on
+    #   the exact NMS-free O2O head; Track A & Track B share IDENTICAL IR KD weights (0.50/0.35/0.50)
+    #   and identical student augmentation (`erasing=0.0`) for strictly controlled ablations!
     # =========================================================================
     "dv_ir_yolo26n": ExperimentConfig(
         exp_name="dv_ir_yolo26n",
         phase="phase4_dv",
-        notes="DroneVehicle IR Student Baseline YOLO26n (50ep cos_lr, 640x512 cropped, 5cls)",
+        notes="DroneVehicle IR Student Baseline YOLO26n (50ep cos_lr, O2O best selection, 5cls)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -1821,12 +1834,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_ir_teacher_s": ExperimentConfig(
         exp_name="dv_ir_teacher_s",
         phase="phase4_dv",
-        notes="DroneVehicle IR Teacher YOLO26s (10.0M/22.8G, 50ep cos_lr)",
+        notes="DroneVehicle IR Teacher YOLO26s (10.0M/22.8G, 50ep cos_lr, O2O best selection)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26s.pt",
@@ -1838,12 +1851,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_ir_teacher_m": ExperimentConfig(
         exp_name="dv_ir_teacher_m",
         phase="phase4_dv",
-        notes="DroneVehicle IR High-Capacity Teacher YOLO26m (21.8M/75.0G, 50ep cos_lr)",
+        notes="DroneVehicle IR High-Capacity Teacher YOLO26m (21.8M/75.0G, 50ep cos_lr, O2O best selection)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26m.pt",
@@ -1855,12 +1868,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_rgb_teacher_s": ExperimentConfig(
         exp_name="dv_rgb_teacher_s",
         phase="phase4_dv",
-        notes="DroneVehicle Privileged RGB Auxiliary Teacher YOLO26s (trained on RGB labels, 50ep cos_lr)",
+        notes="DroneVehicle Privileged RGB Auxiliary Teacher YOLO26s (RGB labels, 50ep cos_lr, O2O best)",
         dataset_name="dronevehicle",
         dataset_mode="rgb",
         model_cfg="yolo26s.pt",
@@ -1872,12 +1885,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_rgb_teacher_m": ExperimentConfig(
         exp_name="dv_rgb_teacher_m",
         phase="phase4_dv",
-        notes="DroneVehicle Privileged RGB High-Capacity Teacher YOLO26m (trained on RGB labels, 50ep cos_lr)",
+        notes="DroneVehicle Privileged RGB High-Capacity Teacher YOLO26m (RGB labels, 50ep cos_lr, O2O best)",
         dataset_name="dronevehicle",
         dataset_mode="rgb",
         model_cfg="yolo26m.pt",
@@ -1889,12 +1902,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_a_s": ExperimentConfig(
         exp_name="dv_kd_track_a_s",
         phase="phase4_dv",
-        notes="DroneVehicle Track A (IR YOLO26s -> IR YOLO26n, +0.00ms): M1 F-PKD + M2 CrossKD-O2O + M3 QG-CIoU-L1",
+        notes="DroneVehicle Track A (IR YOLO26s -> IR YOLO26n, +0.00ms, matched IR weights 0.50/0.35/0.50)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -1912,24 +1925,25 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_feat_mode="fpkd",
         kd_use_m2_cross_o2o=True,
         kd_use_m3_qg_head=True,
-        kd_lambda_feat=0.60,
+        kd_lambda_feat=0.50,
         kd_lambda_cross=0.35,
-        kd_lambda_head=0.60,
+        kd_lambda_head=0.50,
         kd_m2_start_epoch=3,
         kd_m2_warmup_epochs=4,
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
         kd_final_scale=0.0,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_a_m": ExperimentConfig(
         exp_name="dv_kd_track_a_m",
         phase="phase4_dv",
-        notes="DroneVehicle Track A (IR YOLO26m -> IR YOLO26n, +0.00ms): M1 F-PKD + M2 CrossKD-O2O + M3 QG-CIoU-L1",
+        notes="DroneVehicle Track A (IR YOLO26m -> IR YOLO26n, +0.00ms, matched IR weights 0.50/0.35/0.50)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -1947,24 +1961,25 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_feat_mode="fpkd",
         kd_use_m2_cross_o2o=True,
         kd_use_m3_qg_head=True,
-        kd_lambda_feat=0.60,
+        kd_lambda_feat=0.50,
         kd_lambda_cross=0.35,
-        kd_lambda_head=0.60,
+        kd_lambda_head=0.50,
         kd_m2_start_epoch=3,
         kd_m2_warmup_epochs=4,
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
         kd_final_scale=0.0,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_b_s": ExperimentConfig(
         exp_name="dv_kd_track_b_s",
         phase="phase4_dv",
-        notes="DroneVehicle Track B OURS (RGB+IR YOLO26s -> IR-only YOLO26n, +0.00ms): Spatial Night Circuit Breaker + Advantage Gate + 3x3 Low-Pass",
+        notes="DroneVehicle Track B OURS (RGB+IR YOLO26s -> IR-only YOLO26n, +0.00ms): Night Circuit Breaker + Advantage Gate + 3x3 Low-Pass",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -1991,6 +2006,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
@@ -2002,12 +2018,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cm_lowpass_feat=True,
         kd_cm_start_epoch=2,
         kd_cm_warmup_epochs=4,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_b_m": ExperimentConfig(
         exp_name="dv_kd_track_b_m",
         phase="phase4_dv",
-        notes="DroneVehicle Track B OURS (RGB+IR YOLO26m -> IR-only YOLO26n, +0.00ms): Spatial Night Circuit Breaker + Advantage Gate + 3x3 Low-Pass",
+        notes="DroneVehicle Track B OURS (RGB+IR YOLO26m -> IR-only YOLO26n, +0.00ms): Night Circuit Breaker + Advantage Gate + 3x3 Low-Pass",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -2034,6 +2050,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
@@ -2045,12 +2062,12 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cm_lowpass_feat=True,
         kd_cm_start_epoch=2,
         kd_cm_warmup_epochs=4,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_b_naive_s": ExperimentConfig(
         exp_name="dv_kd_track_b_naive_s",
         phase="phase4_dv",
-        notes="DroneVehicle Track B NEGATIVE-TRANSFER CONTROL (Ungated RGB+IR -> IR, no night breaker, no advantage gate)",
+        notes="DroneVehicle Track B NEGATIVE-TRANSFER CONTROL (Ungated RGB+IR -> IR: no night breaker, no advantage gate; keeps low-pass isolated!)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -2077,6 +2094,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
@@ -2085,15 +2103,15 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_lambda_cm_cls=0.30,
         kd_use_night_circuit_breaker=False,
         kd_use_dual_advantage_gate=False,
-        kd_cm_lowpass_feat=False,
+        kd_cm_lowpass_feat=True,
         kd_cm_start_epoch=2,
         kd_cm_warmup_epochs=4,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_track_b_nolp_s": ExperimentConfig(
         exp_name="dv_kd_track_b_nolp_s",
         phase="phase4_dv",
-        notes="DroneVehicle Track B Ablation (without 3x3 AvgPool low-pass parallax filter)",
+        notes="DroneVehicle Track B Ablation (without 3x3 AvgPool low-pass parallax filter; keeps night breaker & advantage gate)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolo26n.pt",
@@ -2120,6 +2138,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cross_cls_weight=0.50,
         kd_cross_sup_weight=0.10,
         kd_m3_cls_weight=0.25,
+        kd_m3_o2m_intersect_student_fg=True,
         kd_m3_o2o_intersect_student_fg=True,
         kd_use_runner_up_kd=False,
         kd_decay_frac=0.30,
@@ -2131,7 +2150,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_cm_lowpass_feat=False,
         kd_cm_start_epoch=2,
         kd_cm_warmup_epochs=4,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_base_cwd_s": ExperimentConfig(
         exp_name="dv_kd_base_cwd_s",
@@ -2156,7 +2175,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_use_m3_qg_head=False,
         kd_decay_frac=0.30,
         kd_final_scale=0.0,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_kd_base_l2_s": ExperimentConfig(
         exp_name="dv_kd_base_l2_s",
@@ -2181,7 +2200,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         kd_use_m3_qg_head=False,
         kd_decay_frac=0.30,
         kd_final_scale=0.0,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_sota_yolov8n": ExperimentConfig(
         exp_name="dv_sota_yolov8n",
@@ -2203,7 +2222,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
     "dv_sota_yolov10n": ExperimentConfig(
         exp_name="dv_sota_yolov10n",
         phase="phase4_dv",
-        notes="DroneVehicle IR SOTA (50ep cos_lr): YOLOv10n (NMS-free E2E)",
+        notes="DroneVehicle IR SOTA (50ep cos_lr): YOLOv10n (NMS-free E2E, O2O best)",
         dataset_name="dronevehicle",
         dataset_mode="ir",
         model_cfg="yolov10n.pt",
@@ -2215,7 +2234,7 @@ PRESETS: Dict[str, ExperimentConfig] = {
         close_mosaic=10,
         cache=False,
         save_period=10,
-        extra_train_kwargs={"cos_lr": True},
+        extra_train_kwargs={"cos_lr": True, "nms": False},
     ),
     "dv_sota_yolo11n": ExperimentConfig(
         exp_name="dv_sota_yolo11n",
