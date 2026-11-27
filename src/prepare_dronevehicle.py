@@ -1,24 +1,13 @@
-"""Deterministic DroneVehicle (RGB + IR) Colab-direct downloader, cropper, HBB converter & Day/Night splitter.
-
-Hardened against partial downloads, corrupt zips/XMLs, failed image writes, and stale caches:
-1. Downloads `val.zip`, `test.zip`, `train.zip` from `McCheng/DroneVehicle` to `.part` files using
-   `curl --fail -L -C -`, verifies exact `Content-Length` + ZIP readability before atomic rename.
-2. Checks local SSD free space before extracting into an isolated temp directory; NEVER skips
-   extraction based on a non-empty partial directory.
-3. Requires ALL FOUR source folders (`*img`, `*imgr`, `*label`, `*labelr`), strict 1:1 pairing
-   (`ir_stems == rgb_stems`), valid XML parsing (failing fast on missing/corrupt XML while allowing
-   legitimate empty `<annotation>`), identical post-crop IR/RGB geometry, and verified `cv2.imwrite`.
-4. Writes canonical `dv_manifest.json` and only publishes `dronevehicle_bundle.zip` via atomic
-   rename inside `bundle_path.parent` after all splits succeed. Fast-path restore verifies the
-   full manifest and always rewrites YAML `path`/`rgb_root` to match `out_root.resolve()`.
-"""
+"""Prepare paired DroneVehicle JPEGs, YOLO HBB labels, and Day/Night splits from DOTA or VOC archives."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -34,8 +23,7 @@ import cv2
 import numpy as np
 import yaml
 
-HF_REPO_ID = "McCheng/DroneVehicle"
-HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main"
+HF_REPO_ID = "nonameplease/DroneVehicleNoBorder"
 
 CLASS_NAMES = ["car", "truck", "bus", "van", "freight_car"]
 CLASS_MAP: Dict[str, int] = {
@@ -63,35 +51,67 @@ IGNORE_LABELS = {"*", "ignore", "ignored", "dontcare", "dont_care", ""}
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
-def _remote_content_length(url: str) -> Optional[int]:
+def _remote_archive_metadata(url: str) -> Tuple[Optional[int], Optional[str]]:
+    # HF can publish the LFS digest on the redirect and a storage-specific ETag on the final URL.
+    headers = []
+
+    class HeadRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            headers.append(hdrs)
+            redirected = super().redirect_request(req, fp, code, msg, hdrs, newurl)
+            if redirected is not None:
+                redirected.method = "HEAD"
+            return redirected
+
+    size = None
     try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            cl = r.headers.get("Content-Length")
-            return int(cl) if cl and cl.isdigit() else None
-    except Exception:
-        return None
+        opener = urllib.request.build_opener(HeadRedirect())
+        with opener.open(urllib.request.Request(url, method="HEAD"), timeout=20) as response:
+            headers.append(response.headers)
+            size = response.headers.get("Content-Length")
+    except OSError:
+        pass
+    size = next((h["X-Linked-Size"] for h in headers if h.get("X-Linked-Size", "").isdigit()), size)
+    digest = None
+    for key in ("X-Linked-Etag", "ETag"):
+        for h in headers:
+            value = h.get(key, "").strip().strip('"')
+            if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                digest = value.lower()
+                break
+        if digest:
+            break
+    expected_size = int(size) if size and size.isdigit() else None
+    return expected_size, digest
 
 
-def _is_valid_zip(path: Path, expected_size: Optional[int] = None) -> bool:
+def _is_valid_zip(path: Path, expected_size: Optional[int] = None, sha256: Optional[str] = None) -> bool:
     if not path.is_file():
         return False
     if expected_size is not None and path.stat().st_size != expected_size:
         return False
     try:
         with zipfile.ZipFile(path, "r") as zf:
-            return len(zf.infolist()) > 0
+            if not zf.infolist():
+                return False
+        if sha256:
+            digest = hashlib.sha256()
+            with path.open("rb") as archive:
+                for chunk in iter(lambda: archive.read(4 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest() == sha256
+        return True
     except Exception:
         return False
 
 
-def _download_hf_file(filename: str, dst_path: Path) -> Path:
+def _download_hf_file(filename: str, dst_path: Path, hf_repo: str = HF_REPO_ID) -> Path:
     """Resumable atomic download to `.part` with `curl --fail`, size check, and ZIP verification."""
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    url = f"{HF_BASE_URL}/{filename}"
-    expected_size = _remote_content_length(url)
+    url = f"https://huggingface.co/datasets/{hf_repo}/resolve/main/{filename}"
+    expected_size, sha256 = _remote_archive_metadata(url)
 
-    if _is_valid_zip(dst_path, expected_size=expected_size):
+    if _is_valid_zip(dst_path, expected_size, sha256):
         print(f"[CACHE] Verified existing archive: {dst_path} ({dst_path.stat().st_size / 1e9:.2f} GB)")
         return dst_path
 
@@ -99,36 +119,29 @@ def _download_hf_file(filename: str, dst_path: Path) -> Path:
     print(f"[DOWNLOAD] Fetching {filename} from {url} (expected={expected_size or 'unknown'} B) ...")
 
     curl_bin = shutil.which("curl")
-    if curl_bin:
-        cmd = [
-            curl_bin,
-            "--fail",
-            "-L",
-            "-C",
-            "-",
-            "--retry",
-            "5",
-            "--retry-delay",
-            "5",
-            "--connect-timeout",
-            "30",
-            "-o",
-            str(part_path),
-            url,
-        ]
-        print(f"[CMD] {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-    else:
-        with urllib.request.urlopen(url, timeout=60) as resp, part_path.open("wb") as out_f:
-            shutil.copyfileobj(resp, out_f, length=4 * 1024 * 1024)
-
-    if not _is_valid_zip(part_path, expected_size=expected_size):
-        actual = part_path.stat().st_size if part_path.is_file() else 0
-        raise RuntimeError(
-            f"Downloaded archive '{part_path}' failed integrity check "
-            f"(actual={actual} B vs expected={expected_size} B)!"
-        )
-    os.replace(part_path, dst_path)
+    for attempt in range(6):
+        try:
+            if curl_bin:
+                subprocess.run([curl_bin, "--fail", "-L", "-C", "-", "--connect-timeout", "30",
+                                "-o", str(part_path), url], check=True)
+            else:
+                with urllib.request.urlopen(url, timeout=60) as resp, part_path.open("wb") as out_f:
+                    shutil.copyfileobj(resp, out_f, length=4 * 1024 * 1024)
+            if not _is_valid_zip(part_path, expected_size, sha256):
+                raise RuntimeError(f"Archive integrity check failed for {filename} "
+                                   f"(expected size={expected_size}, SHA-256={sha256})")
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            part_path.unlink(missing_ok=True)
+            if attempt == 5:
+                raise
+            print(f"[RETRY] {exc}; restarting {filename} in 5 seconds")
+            time.sleep(5)
+            continue
+        except BaseException:
+            part_path.unlink(missing_ok=True)
+            raise
+        os.replace(part_path, dst_path)
+        break
     return dst_path
 
 
@@ -228,26 +241,65 @@ def _parse_dv_xml_to_hbb(
                 skipped_counter["point"] += 1
             continue
 
-        xs, ys = zip(*vertices)
-        raw_x1, raw_x2 = min(xs) - pad, max(xs) - pad
-        raw_y1, raw_y2 = min(ys) - pad, max(ys) - pad
-        raw_area = max((raw_x2 - raw_x1) * (raw_y2 - raw_y1), 1e-6)
+        _append_hbb(boxes, cls_id, vertices, pad, out_w, out_h, class_counter)
+    return boxes
 
-        x1 = max(0.0, min(float(out_w), raw_x1))
-        y1 = max(0.0, min(float(out_h), raw_y1))
-        x2 = max(0.0, min(float(out_w), raw_x2))
-        y2 = max(0.0, min(float(out_h), raw_y2))
-        bw = x2 - x1
-        bh = y2 - y1
-        if bw <= 1.5 or bh <= 1.5:
-            continue
-        if (bw * bh) / raw_area < 0.10:
-            continue
 
-        xc = (x1 + x2) * 0.5 / float(out_w)
-        yc = (y1 + y2) * 0.5 / float(out_h)
-        boxes.append((cls_id, xc, yc, bw / float(out_w), bh / float(out_h)))
-        class_counter[CLASS_NAMES[cls_id]] += 1
+def _append_hbb(boxes, cls_id, vertices, pad, out_w, out_h, class_counter):
+    xs, ys = zip(*vertices)
+    raw_x1, raw_x2 = min(xs) - pad, max(xs) - pad
+    raw_y1, raw_y2 = min(ys) - pad, max(ys) - pad
+    raw_area = max((raw_x2 - raw_x1) * (raw_y2 - raw_y1), 1e-6)
+
+    x1 = max(0.0, min(float(out_w), raw_x1))
+    y1 = max(0.0, min(float(out_h), raw_y1))
+    x2 = max(0.0, min(float(out_w), raw_x2))
+    y2 = max(0.0, min(float(out_h), raw_y2))
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw <= 1.5 or bh <= 1.5:
+        return
+    if (bw * bh) / raw_area < 0.10:
+        return
+
+    xc = (x1 + x2) * 0.5 / float(out_w)
+    yc = (y1 + y2) * 0.5 / float(out_h)
+    boxes.append((cls_id, xc, yc, bw / float(out_w), bh / float(out_h)))
+    class_counter[CLASS_NAMES[cls_id]] += 1
+
+
+def _parse_dv_dota_to_hbb(
+    txt_path: Path,
+    pad: int,
+    out_w: int,
+    out_h: int,
+    unknown_counter: Counter,
+    class_counter: Counter,
+) -> List[Tuple[int, float, float, float, float]]:
+    """Convert DOTA quadrilaterals using the literal class name and optional difficulty."""
+    boxes = []
+    with txt_path.open(encoding="utf-8-sig") as annotations:
+        for lineno, line in enumerate(annotations, 1):
+            fields = line.split()
+            if not fields:
+                continue
+            names = fields[8:]
+            if names and re.fullmatch(r"[+-]?\d+", names[-1]):
+                names.pop()
+            try:
+                coords = [float(x) for x in fields[:8]]
+                if len(coords) != 8 or not all(map(math.isfinite, coords)) or not names:
+                    raise ValueError("expected eight finite coordinates and a class name")
+            except ValueError as exc:
+                raise ValueError(f"Malformed DOTA annotation {txt_path}:{lineno}: {line.strip()!r}") from exc
+            name = " ".join(names).lower()
+            if name in IGNORE_LABELS:
+                continue
+            cls_id = CLASS_MAP.get(name)
+            if cls_id is None:
+                unknown_counter[name] += 1
+                continue
+            _append_hbb(boxes, cls_id, zip(coords[::2], coords[1::2]), pad, out_w, out_h, class_counter)
     return boxes
 
 
@@ -258,27 +310,34 @@ def _write_yolo_txt(path: Path, boxes: List[Tuple[int, float, float, float, floa
 
 def _find_split_subdirs(extract_dir: Path, split: str) -> Tuple[Path, Path, Path, Path]:
     """Locate ALL FOUR required subdirs (rgb_img, ir_img, rgb_lbl, ir_lbl); fail fast if any is missing."""
-    all_dirs = [p for p in extract_dir.rglob("*") if p.is_dir()]
-    name_map = {p.name.lower(): p for p in all_dirs}
+    matches = []
+    flat_names = (
+        (f"{split}img", "rgb", "images_rgb"),
+        (f"{split}imgr", "ir", "infrared", "images_ir"),
+        (f"{split}label", "labels_rgb", "label"),
+        (f"{split}labelr", "labels_ir", "labelr"),
+    )
+    for parent, subdirs, _ in os.walk(extract_dir):
+        root = Path(parent)
+        # A pre-extracted directory can hold train, val, and test side by side.
+        subdirs[:] = [d for d in subdirs if d.lower() not in {"train", "val", "test"} - {split}]
+        children = {d.lower(): root / d for d in subdirs}
+        if root.name.lower() == split and "rgb" in children and "ir" in children:
+            rgb, ir = children["rgb"], children["ir"]
+            labels = [m / ("dota_labels" if (m / "dota_labels").is_dir() else "labels") for m in (rgb, ir)]
+            dirs = (rgb / "images", ir / "images", *labels)
+            if all(p.is_dir() for p in dirs):
+                matches.append(dirs)
 
-    def _pick(candidates: List[str]) -> Optional[Path]:
-        for c in candidates:
-            if c in name_map:
-                return name_map[c]
-        return None
+        flat = [next((children[n] for n in names if n in children), None) for names in flat_names]
+        if all(flat):
+            matches.append(tuple(flat))
 
-    rgb_img = _pick([f"{split}img", "rgb", "images_rgb"])
-    ir_img = _pick([f"{split}imgr", "ir", "infrared", "images_ir"])
-    rgb_lbl = _pick([f"{split}label", "labels_rgb", "label"])
-    ir_lbl = _pick([f"{split}labelr", "labels_ir", "labelr"])
-
-    if not all([rgb_img, ir_img, rgb_lbl, ir_lbl]):
-        found = sorted(str(p.relative_to(extract_dir)) for p in all_dirs)
-        raise FileNotFoundError(
-            f"DroneVehicle '{split}' requires ALL 4 subdirs (rgb_img, ir_img, rgb_lbl, ir_lbl); "
-            f"got rgb_img={rgb_img}, ir_img={ir_img}, rgb_lbl={rgb_lbl}, ir_lbl={ir_lbl}. Found: {found[:30]}"
-        )
-    return rgb_img, ir_img, rgb_lbl, ir_lbl  # type: ignore[return-value]
+    if not matches:
+        raise FileNotFoundError(f"Missing complete DroneVehicle '{split}' layout under {extract_dir}")
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous DroneVehicle '{split}' layouts under {extract_dir}: {matches}")
+    return matches[0]
 
 
 def _crop_border_if_needed(im: np.ndarray, border: int = 100) -> Tuple[np.ndarray, int]:
@@ -334,10 +393,14 @@ def _process_single_pair(
     lum_std = float(rgb_f.std())
 
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
-    if not cv2.imwrite(str(out_ir_img), ir_crop, encode_params):
-        raise OSError(f"cv2.imwrite failed for IR image: {out_ir_img}")
-    if not cv2.imwrite(str(out_rgb_img), rgb_crop, encode_params):
-        raise OSError(f"cv2.imwrite failed for RGB image: {out_rgb_img}")
+    for src, dst, pixels, pad, original_size in (
+        (ir_src, out_ir_img, ir_crop, pad_ir, (w_ir, h_ir)),
+        (rgb_src, out_rgb_img, rgb_crop, pad_rgb, (w_rgb, h_rgb)),
+    ):
+        if pad == 0 and original_size == (w_ir, h_ir) == (640, 512) and src.suffix.lower() in {".jpg", ".jpeg"}:
+            shutil.copy2(src, dst)
+        elif not cv2.imwrite(str(dst), pixels, encode_params):
+            raise OSError(f"cv2.imwrite failed for image: {dst}")
 
     skipped: Counter = Counter()
     unk_ir: Counter = Counter()
@@ -345,15 +408,17 @@ def _process_single_pair(
     unk_rgb: Counter = Counter()
     cls_rgb: Counter = Counter()
 
-    ir_boxes = _parse_dv_xml_to_hbb(
-        ir_xml, pad=pad_ir, out_w=w_ir, out_h=h_ir, unknown_counter=unk_ir, class_counter=cls_ir,
-        skipped_counter=skipped,
-    )
-    # Use pre-resize `(w_rgb, h_rgb)` so normalized RGB labels stay geometrically exact!
-    rgb_boxes = _parse_dv_xml_to_hbb(
-        rgb_xml, pad=pad_rgb, out_w=w_rgb, out_h=h_rgb, unknown_counter=unk_rgb, class_counter=cls_rgb,
-        skipped_counter=skipped,
-    )
+    def parse_label(path, pad, width, height, unknown, classes):
+        if path.suffix.lower() == ".txt":
+            return _parse_dv_dota_to_hbb(path, pad, width, height, unknown, classes)
+        if path.suffix.lower() == ".xml":
+            return _parse_dv_xml_to_hbb(path, pad=pad, out_w=width, out_h=height,
+                                        unknown_counter=unknown, class_counter=classes, skipped_counter=skipped)
+        raise ValueError(f"Unsupported annotation format: {path}")
+
+    ir_boxes = parse_label(ir_xml, pad_ir, w_ir, h_ir, unk_ir, cls_ir)
+    # RGB labels are expressed in the pre-resize coordinate system.
+    rgb_boxes = parse_label(rgb_xml, pad_rgb, w_rgb, h_rgb, unk_rgb, cls_rgb)
     _write_yolo_txt(out_ir_lbl, ir_boxes)
     _write_yolo_txt(out_rgb_lbl, rgb_boxes)
 
@@ -728,6 +793,7 @@ def prepare_dronevehicle(
     day_lum_thresh: float = 0.15,
     workers: int = 8,
     keep_raw: bool = False,
+    hf_repo: str = HF_REPO_ID,
 ) -> Dict[str, object]:
     out_root.mkdir(parents=True, exist_ok=True)
     if drive_bundle is not None and _restore_from_bundle(out_root, drive_bundle):
@@ -764,7 +830,7 @@ def prepare_dronevehicle(
             if extract_dir.exists():
                 shutil.rmtree(extract_dir)
             zip_path = work_raw / f"{split}.zip"
-            _download_hf_file(f"{split}.zip", zip_path)
+            _download_hf_file(f"{split}.zip", zip_path, hf_repo)
             with zipfile.ZipFile(zip_path, "r") as zf:
                 need_bytes = sum(i.file_size for i in zf.infolist())
                 free_bytes = shutil.disk_usage(work_raw).free
@@ -801,13 +867,16 @@ def prepare_dronevehicle(
         for d in (out_ir_img_dir, out_ir_lbl_dir, out_rgb_img_dir, out_rgb_lbl_dir):
             d.mkdir(parents=True, exist_ok=True)
 
+        ir_ext, rgb_ext = (".txt" if any(p.is_file() for p in d.glob("*.txt")) else ".xml"
+                           for d in (ir_lbl_dir, rgb_lbl_dir))
+
         def _worker(st: str) -> Dict[str, object]:
             return _process_single_pair(
                 st,
                 ir_files[st],
                 rgb_files[st],
-                ir_lbl_dir / f"{st}.xml",
-                rgb_lbl_dir / f"{st}.xml",
+                ir_lbl_dir / f"{st}{ir_ext}",
+                rgb_lbl_dir / f"{st}{rgb_ext}",
                 out_ir_img_dir / f"{st}.jpg",
                 out_rgb_img_dir / f"{st}.jpg",
                 out_ir_lbl_dir / f"{st}.txt",
@@ -871,6 +940,7 @@ def main() -> None:
     parser.add_argument("--jpeg-quality", type=int, default=95)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--keep-raw", action="store_true")
+    parser.add_argument("--hf-repo", default=HF_REPO_ID, help="Hugging Face dataset repository ID.")
     args = parser.parse_args()
 
     prepare_dronevehicle(
@@ -882,6 +952,7 @@ def main() -> None:
         day_lum_thresh=args.day_thresh,
         workers=args.workers,
         keep_raw=args.keep_raw,
+        hf_repo=args.hf_repo,
     )
 
 
