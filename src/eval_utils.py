@@ -198,15 +198,23 @@ def evaluate_checkpoint(
         "evals": {},
     }
 
-    def _run_val(split: str, *, nms: Optional[bool], rect: bool, eval_imgsz: int) -> Dict[str, Any]:
+    def _run_val(
+        split: str,
+        *,
+        nms: Optional[bool],
+        rect: bool,
+        eval_imgsz: int,
+        data_yaml: Optional[Path] = None,
+        allow_plots: bool = True,
+    ) -> Dict[str, Any]:
         val_kwargs: Dict[str, Any] = {
-            "data": str(dataset_yaml),
+            "data": str(data_yaml or dataset_yaml),
             "split": split,
             "imgsz": eval_imgsz,
             "batch": batch,
             "rect": rect,
             "verbose": False,
-            "plots": (split == "test" and not rect and (nms is False or not is_e2e_model)),
+            "plots": (allow_plots and split == "test" and not rect and (nms is False or not is_e2e_model)),
         }
         if nms is not None:
             val_kwargs["nms"] = nms
@@ -235,14 +243,32 @@ def evaluate_checkpoint(
             except Exception as exc:
                 print(f"[WARN] Could not evaluate O2M (nms=True) on {split}: {exc}")
 
-    # 3. Native 640x512 rectangular inference evaluation on Test (crucial for Mod A P2!)
+    # 3. Rectangular inference evaluation on Test (note: Ultralytics rect=True pads 512x640 -> 544x672)
     if eval_rect_640x512:
         tag = "test_o2o_rect640x512" if is_e2e_model else "test_nms_rect640x512"
         try:
-            print(f"[EVAL] Running native rectangular {tag} (rect=True, imgsz=640 -> 640x512) ...")
+            print(f"[EVAL] Running rectangular {tag} (rect=True, imgsz=640; stride-32 padded) ...")
             summary["evals"][tag] = _run_val("test", nms=primary_nms, rect=True, eval_imgsz=640)
         except Exception as exc:
-            print(f"[WARN] Rectangular 640x512 eval failed: {exc}")
+            print(f"[WARN] Rectangular eval failed: {exc}")
+
+    # 3a. Automatic Daytime vs Nighttime subset evaluation when companion *_day.yaml / *_night.yaml exist
+    for subset in ("day", "night"):
+        sub_yaml = dataset_yaml.parent / f"{dataset_yaml.stem}_{subset}.yaml"
+        if sub_yaml.is_file():
+            tag = f"test_{subset}_640"
+            try:
+                print(f"[EVAL] Running {subset.upper()} breakdown {tag} ({sub_yaml.name}, nms={primary_nms}) ...")
+                summary["evals"][tag] = _run_val(
+                    "test",
+                    nms=primary_nms,
+                    rect=False,
+                    eval_imgsz=imgsz,
+                    data_yaml=sub_yaml,
+                    allow_plots=False,
+                )
+            except Exception as exc:
+                print(f"[WARN] {subset} breakdown eval failed: {exc}")
 
     # 3b. Compute anti-noise 3-Class Main Avg (Person/Car/Bicycle, 99.4% of HIT-UAV test instances)
     primary_test = summary["evals"].get("test_o2o_640" if is_e2e_model else "test_nms_640", {})
@@ -312,40 +338,83 @@ def _append_master_csv(summary: Dict[str, Any], csv_path: Path) -> None:
         extra_tags.append(f"O2M={summary['test_o2m_mAP50']*100:.2f}%")
     if summary.get("test_rect_minus_square_mAP50") is not None:
         extra_tags.append(f"rect-sq={summary['test_rect_minus_square_mAP50']*100:+.2f}%")
+    day_m = summary["evals"].get("test_day_640", {})
+    night_m = summary["evals"].get("test_night_640", {})
+    if day_m:
+        extra_tags.append(f"Day={day_m.get('mAP50', 0)*100:.2f}/{day_m.get('mAP50_95', 0)*100:.2f}")
+    if night_m:
+        extra_tags.append(f"Night={night_m.get('mAP50', 0)*100:.2f}/{night_m.get('mAP50_95', 0)*100:.2f}")
     notes_str = summary.get("notes", "")
     if extra_tags:
         notes_str = f"{notes_str} [{' | '.join(extra_tags)}]".strip()
 
-    row = {
-        "timestamp": summary["timestamp"],
-        "exp_name": summary["exp_name"],
-        "dataset_mode": summary["dataset_mode"],
-        "seed": summary["seed"],
-        "is_e2e": is_e2e,
-        "params_M": summary["params_M"],
-        "gflops": summary["gflops"],
-        "val_mAP50": val_m.get("mAP50", ""),
-        "val_mAP50_95": val_m.get("mAP50_95", ""),
-        "test_mAP50": test_m.get("mAP50", ""),
-        "test_mAP50_95": test_m.get("mAP50_95", ""),
-        "test_P": test_m.get("precision", ""),
-        "test_R": test_m.get("recall", ""),
-        "test_AP50_Person": pc50.get("Person", ""),
-        "test_AP50_Car": pc50.get("Car", ""),
-        "test_AP50_Bicycle": pc50.get("Bicycle", ""),
-        "test_AP50_OtherVehicle": pc50.get("OtherVehicle", ""),
-        "test_AP50_DontCare": pc50.get("DontCare", ""),
-        "test_delta_E2E_mAP50": summary.get("test_delta_e2e_map50", ""),
-        "test_delta_E2E_mAP50_95": summary.get("test_delta_e2e_map50_95", ""),
-        "test_inf_ms": test_m.get("inference_ms", ""),
-        "test_post_ms": test_m.get("postprocess_ms", ""),
-        "test_total_ms": test_m.get("total_ms", ""),
-        "test_fps": test_m.get("fps", ""),
-        "rect640x512_mAP50": rect_m.get("mAP50", ""),
-        "rect640x512_total_ms": rect_m.get("total_ms", ""),
-        "onnx_cpu_512x640_ms": onnx_rect.get("cpu_latency_ms", ""),
-        "notes": notes_str,
-    }
+    is_dv = summary.get("dataset_mode") in {"ir", "rgb"} or ("car" in pc50 and "truck" in pc50)
+    if is_dv:
+        row = {
+            "timestamp": summary["timestamp"],
+            "exp_name": summary["exp_name"],
+            "dataset_mode": summary["dataset_mode"],
+            "seed": summary["seed"],
+            "is_e2e": is_e2e,
+            "params_M": summary["params_M"],
+            "gflops": summary["gflops"],
+            "val_mAP50": val_m.get("mAP50", ""),
+            "val_mAP50_95": val_m.get("mAP50_95", ""),
+            "test_mAP50": test_m.get("mAP50", ""),
+            "test_mAP50_95": test_m.get("mAP50_95", ""),
+            "test_day_mAP50": day_m.get("mAP50", ""),
+            "test_day_mAP50_95": day_m.get("mAP50_95", ""),
+            "test_night_mAP50": night_m.get("mAP50", ""),
+            "test_night_mAP50_95": night_m.get("mAP50_95", ""),
+            "test_P": test_m.get("precision", ""),
+            "test_R": test_m.get("recall", ""),
+            "test_AP50_car": pc50.get("car", ""),
+            "test_AP50_truck": pc50.get("truck", ""),
+            "test_AP50_bus": pc50.get("bus", ""),
+            "test_AP50_van": pc50.get("van", ""),
+            "test_AP50_freight_car": pc50.get("freight_car", ""),
+            "test_delta_E2E_mAP50": summary.get("test_delta_e2e_map50", ""),
+            "test_delta_E2E_mAP50_95": summary.get("test_delta_e2e_map50_95", ""),
+            "test_inf_ms": test_m.get("inference_ms", ""),
+            "test_post_ms": test_m.get("postprocess_ms", ""),
+            "test_total_ms": test_m.get("total_ms", ""),
+            "test_fps": test_m.get("fps", ""),
+            "rect640x512_mAP50": rect_m.get("mAP50", ""),
+            "rect640x512_total_ms": rect_m.get("total_ms", ""),
+            "onnx_cpu_512x640_ms": onnx_rect.get("cpu_latency_ms", ""),
+            "notes": notes_str,
+        }
+    else:
+        row = {
+            "timestamp": summary["timestamp"],
+            "exp_name": summary["exp_name"],
+            "dataset_mode": summary["dataset_mode"],
+            "seed": summary["seed"],
+            "is_e2e": is_e2e,
+            "params_M": summary["params_M"],
+            "gflops": summary["gflops"],
+            "val_mAP50": val_m.get("mAP50", ""),
+            "val_mAP50_95": val_m.get("mAP50_95", ""),
+            "test_mAP50": test_m.get("mAP50", ""),
+            "test_mAP50_95": test_m.get("mAP50_95", ""),
+            "test_P": test_m.get("precision", ""),
+            "test_R": test_m.get("recall", ""),
+            "test_AP50_Person": pc50.get("Person", ""),
+            "test_AP50_Car": pc50.get("Car", ""),
+            "test_AP50_Bicycle": pc50.get("Bicycle", ""),
+            "test_AP50_OtherVehicle": pc50.get("OtherVehicle", ""),
+            "test_AP50_DontCare": pc50.get("DontCare", ""),
+            "test_delta_E2E_mAP50": summary.get("test_delta_e2e_map50", ""),
+            "test_delta_E2E_mAP50_95": summary.get("test_delta_e2e_map50_95", ""),
+            "test_inf_ms": test_m.get("inference_ms", ""),
+            "test_post_ms": test_m.get("postprocess_ms", ""),
+            "test_total_ms": test_m.get("total_ms", ""),
+            "test_fps": test_m.get("fps", ""),
+            "rect640x512_mAP50": rect_m.get("mAP50", ""),
+            "rect640x512_total_ms": rect_m.get("total_ms", ""),
+            "onnx_cpu_512x640_ms": onnx_rect.get("cpu_latency_ms", ""),
+            "notes": notes_str,
+        }
 
     fieldnames = list(row.keys())
     write_header = not csv_path.exists()
@@ -392,6 +461,12 @@ def _print_compact_table(summary: Dict[str, Any]) -> None:
         rect_gap = summary.get("test_rect_minus_square_mAP50")
         gap_s = f" | Rect640x512-Sq={rect_gap:+.4f}" if rect_gap is not None else ""
         print(f"  Anti-Noise 3-Class Main Avg (Person/Car/Bicycle): {summary['test_3cls_mAP50']:.4f}{gap_s}")
+    day_d = summary["evals"].get("test_day_640")
+    night_d = summary["evals"].get("test_night_640")
+    if day_d or night_d:
+        ds = f"{day_d.get('mAP50', 0):.4f}/{day_d.get('mAP50_95', 0):.4f}" if day_d else "N/A"
+        ns = f"{night_d.get('mAP50', 0):.4f}/{night_d.get('mAP50_95', 0):.4f}" if night_d else "N/A"
+        print(f"  Day vs Night Breakdown (Test 640): Day={ds} | Night={ns}")
     pc = tm.get("per_class_ap50", {})
     if pc:
         cls_str = " | ".join(f"{k}={v:.4f}" for k, v in pc.items())

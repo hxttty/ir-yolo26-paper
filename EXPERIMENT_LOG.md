@@ -118,7 +118,24 @@
       - **小样本容量匹配结论**：在 2K HIT-UAV 上，**`teacher_yolo26s` 在 Val、Test O2O、Rect 和 `Δ_E2E (-0.80%)` 全面优于 22M 的 `m`**，同时速度 3.3× 更快、容量差更小（`4×` vs `8.6×`），自然成为 HIT-UAV 最佳蒸馏教师（`YOLO26m` 留给 18K `DroneVehicle` 主战场）。
     - **`kd_yolo26.py` + `run_phase3_auto.py` 经 Astra 对抗审计全量加固（commit `b57ce0c`, 2026-11-27 00:39 JST）**：
       - 已修复全部 3 P0 + 7 P1 + 3 P2：KD 非有限直接 `FloatingPointError` 熔断、子进程非零退出立即失败（绝不误判为 `SCENARIO_C_BRAKE`）、**全链路严格 Val-Only 选老师/赢家/5-seed（零 Test 泄漏）**、去掉学生 pre-hook 直用 `s_o2m["feats"]`、完整 `kd_state.pt`（adapters + AdamW 矩）同步恢复、训完中断直跳过训练补评测、`validate_teacher_compatibility`、硬 `timeout` 防挂死、Gate 1 正式 `batch=32` + `adapter_steps>=1` + `best.pt` 字节流纯净度校验、精确无截断 `compute_soft_bce_kd`、锁死 `ultralytics==8.4.219`。
-      - **实时运行中（2026-11-27 00:52 JST 启动）**：Colab Pro L4 正在跑 `EXP_LIST = ["auto_phase3_overnight"]`（`SMOKE_TEST=False, AUTO_UNASSIGN=True`）。**Gate 0 + Gate 1 已于 00:54 JST 一次性绿灯通关**：Val-Only 自动锁定 `teacher_yolo26s` (`0.71774 > 0.71059`)；2-ep 正式 `batch=32` 冒烟耗时 119s、`peak_vram=7.28 GB`、`adapter_steps=80 / kd_batches=128`、`best.pt` 强验为 **100% 纯净原生 `2.5353M / 708 tensors / 0 KD refs`**（2 ep 即达 Test O2O `55.00% / 30.12%`, `3cls 73.16%`），现已进入 Gate 2 正式训练！Drive 实时决策日志 ID：`10JCZD82G2ip6zWtUGwvDHrWe2gKAqqEI` (`logs/auto_phase3_report.md`)。
+      - **过夜全自动实验已干净完赛（2026-11-27 00:52–06:31 JST, 总耗时 5.65h, Scenario C 熔断生效并自动释放 GPU）**：
+        - **Gate 0 + Gate 1 绿灯通关**：Val-Only 锁定 `teacher_yolo26s`，2-ep 正式 `batch=32` 冒烟确认 `best.pt` 100% 纯净（`2.5353M / 708 tensors / 0 KD refs`, `peak_vram=7.28 GB`）。
+        - **Gate 2（5 组 KD 探针全部低于 `v33_e0_base` `Val 90.64/60.55 | Test 86.48/56.34`，自动触发 Scenario C 省 CU 刹车）**：
+          - `p3_kd_full_s` (`M1+M2+M3+run`)：Val `87.14/58.76` | Test O2O `84.98/55.82` | 3cls `91.45%` | `Δ_E2E +1.80%` | Rect `85.48%`（**但 `O2M+NMS` train-val 飙至 `92.6/64.3` 峰值 `64.6` 反超基线 `63.7` 与教师 `62.6`！**）
+          - `p3_kd_full_norun_s` (`M1+M2+M3`)：Val `87.49/59.14` | Test O2O `84.44/55.34` | 3cls `91.49%` | `Δ_E2E +1.38%` | Rect `84.77%`
+          - `p3_kd_gentle_s` (`0.3× M1/M2/M3`)：Val `88.30/59.08` | Test O2O `85.77/55.86` | 3cls `91.61%` | `Δ_E2E +1.65%` | Rect `86.70%`
+          - `p3_kd_m1_fpkd_s` (仅 `M1`)：Val `89.18/58.72` | Test O2O `85.80/55.73` | 3cls `92.24%` | `Δ_E2E +1.21%` | Rect `85.26%`
+          - `p3_kd_m12_cross_s` (`M1+M2`, 无 `M3`)：Val `89.26/59.17` | Test O2O `86.37/56.09` | 3cls `92.30%` | `Δ_E2E +1.38%`（Val `Δ_E2E = 0.00%`！）| **Rect `87.15/57.1`（反超基线 `85.97` +1.18%！）**
+        - **Gate 3 同步收齐全部 4 组统一 100ep `cos_lr` SOTA 基线（`seed=42`, L4）**：
+          - `v33_sota_yolov8n` (`3.14M/8.8G`, NMS)：Val `88.68/60.11` | Test `86.48/57.24` | 3cls `93.15%` | Rect `87.47%` | `3.04 ms (329 FPS)`
+          - `v33_sota_yolov10n` (`2.74M/8.6G`, E2E)：Val `88.81/59.44` | Test `85.66/55.87` | 3cls `92.64%` | `Δ_E2E +1.63%` | Rect `86.00%` | `2.46 ms (406 FPS)`
+          - `v33_sota_yolo11n` (`2.61M/6.6G`, NMS)：Val `90.51/60.94` | Test `87.37/56.93` | 3cls `93.02%` | Rect `87.86%` | `3.28 ms (305 FPS)`
+          - `v33_sota_yolo12n` (`2.58M/7.5G`, NMS)：Val `90.23/59.89` | Test `87.35/57.22` | 3cls `92.91%` | Rect `88.46%` | `4.09 ms (245 FPS)`
+        - **深度“尸检”铁证（3 大真实根因，100% 定位！）**：
+          1. **硬核算法 BUG：`M3` 的 1-to-1 O2O 锚点错位拔河（`t_o2o_fg ≠ s_o2o_fg`）**：开 `M3` 后 O2O `cls_loss` 暴涨 `+30%`（Ep80 `0.52→0.68`, Ep100 `0.44→0.54`），`p3_kd_full_s` 的 O2M+NMS 飙到 `64.3%`（峰值 `64.6%`）但 O2O Recall 暴跌 `85.8%→79.7%`。原因：在 `topk2=1` 稀疏匹配下，当教师与学生对同一小目标选了相邻的不同锚点时，原生 GT 死命把教师锚点压向 `0`，`M3` 却同时把它拉向教师正 logit（还乘 `T^2=4`）！**必修复**：`M3` 的 O2O 正监督必须严格限制在 `t_o2o_fg & s_o2o_fg` 交集上（绝不与原生 O2O 负样本硬刚），且 `M2` 延迟到 Ep 5 适配器预热后再开启（消除 Ep 1 `M2=9.94` 冲击），KD 衰减提早至 `0.50→1.00` 留足后期精调。
+          2. **2K HIT-UAV 单模态蒸馏天花板饱和（教师过拟合）**：`teacher_yolo26s` 在 2,029 张训练集上第 66 轮即过拟合（`Val O2O` 仅比学生高 `+0.34% mAP50`，`Val/Test O2M` 甚至低于/持平学生 `92.0 vs 92.7`、`87.21 vs 87.20`），纯 `M1` 把学生 Neck 强拉到 `corr=0.928` 直接传递了教师训练集过拟合；而叠加 `M2 CrossKD-O2O` 全面反超纯 `M1`（`Rect +1.89%`, `Test +0.57%`, `Val Δ_E2E → 0.00%`），验证跨头梯度桥本身方向是对的。
+          3. **主战场切换铁证**：必须先修复上述 `kd_yolo26.py` 3 处缺陷，再将主火力切换至 **17,990 张训练 / 8,980 张测试且自带配对 RGB 的 `DroneVehicle`**（既有 `YOLO26m` 真正的大样本容量差，更有白天 RGB 跨模态特权语义增益 + 夜间熔断防负迁移故事），视需要再用修好后的 `kd_yolo26.py` 补 1 组 45 分钟 HIT-UAV 验证复盘。
+      - Drive 实时决策日志 ID：`10JCZD82G2ip6zWtUGwvDHrWe2gKAqqEI` (`logs/auto_phase3_report.md`)。
     - **`kd_yolo26.py` 零延迟三模块蒸馏引擎已落地（2026-11-26 23:57 JST）**：
       - 实现 `src/modules/kd_yolo26.py`（`M1 F-PKD` + `M2 CrossKD-O2O` 绕过 `x_detach` + `M3 QG-CIoU-L1` 无分布双头校准 + 公平对照基线 `CWD` / `Official PR#24894 L2` / `QG-KD 1-IoU` + Track B 夜间熔断与双师优势门控原语）；
       - 适配器独立 `AdamW` 随 `GradScaler` 步进（绕过 `MuSGD` 正交化与 `LambdaLR` 冲突），`deepcopy`/`pickle` 严格剥离教师与适配器（确保导出 `best.pt` 为 100% 纯净 `2.535M / 6.035G / 418 FPS` 原生 `YOLO26n`）；

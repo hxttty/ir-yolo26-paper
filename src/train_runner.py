@@ -86,6 +86,43 @@ def _sync_weights_and_csv(local_run_dir: Path, drive_run_dir: Path) -> None:
             shutil.copy2(src_f, drive_run_dir / fname)
 
 
+def _resolve_teacher_ckpt(
+    *,
+    explicit_weights: Optional[str],
+    run_name: Optional[str],
+    local_project: Path,
+    local_work_dir: Path,
+    drive_dir: Optional[Path],
+    tag: str,
+) -> Path:
+    resolved: Optional[Path] = None
+    if explicit_weights and Path(explicit_weights).is_file():
+        resolved = Path(explicit_weights)
+    elif run_name:
+        search_candidates = [local_project / run_name / "weights" / "best.pt"]
+        if drive_dir is not None:
+            search_candidates.append(drive_dir / "runs" / run_name / "weights" / "best.pt")
+        for cand in search_candidates:
+            if cand.is_file():
+                if drive_dir is not None and cand.is_relative_to(drive_dir):
+                    cached_dir = local_work_dir / "teacher_cache" / run_name
+                    cached_dir.mkdir(parents=True, exist_ok=True)
+                    cached_pt = cached_dir / "best.pt"
+                    if not cached_pt.is_file():
+                        shutil.copy2(cand, cached_pt)
+                    resolved = cached_pt
+                else:
+                    resolved = cand
+                break
+    if resolved is None:
+        raise FileNotFoundError(
+            f"KD {tag} teacher weights not found! Looked for weights='{explicit_weights}' "
+            f"and run='{run_name}' under {local_project} / {drive_dir}."
+        )
+    print(f"[PHASE 3 KD] Resolved frozen {tag} teacher checkpoint: {resolved}")
+    return resolved
+
+
 def run_experiment(
     cfg: ExperimentConfig,
     *,
@@ -94,17 +131,37 @@ def run_experiment(
     drive_dir: Optional[Path],
     repo_root: Path,
 ) -> Path:
-    dataset_yaml = dataset_root / f"hit_uav_{cfg.dataset_mode}.yaml"
-    if not dataset_yaml.is_file():
-        raise FileNotFoundError(
-            f"Dataset YAML not found: {dataset_yaml}\n"
-            "Run `python -m src.prepare_hituav` first!"
-        )
+    if cfg.dataset_name == "dronevehicle":
+        dataset_yaml = dataset_root / f"dronevehicle_{cfg.dataset_mode}.yaml"
+        if not dataset_yaml.is_file():
+            print(f"[AUTO-DATA] {dataset_yaml} not found -> preparing DroneVehicle directly on Colab SSD ...")
+            from src.prepare_dronevehicle import prepare_dronevehicle
+
+            prepare_dronevehicle(
+                out_root=dataset_root,
+                drive_bundle=(drive_dir / "datasets" / "dronevehicle_bundle.zip") if drive_dir is not None else None,
+                vis_dir=(drive_dir / "audit" / "dv_sanity_vis") if drive_dir is not None else None,
+            )
+        if not dataset_yaml.is_file():
+            raise FileNotFoundError(f"DroneVehicle YAML missing even after preparation: {dataset_yaml}")
+        master_csv_name = "master_results_dronevehicle.csv"
+    else:
+        dataset_yaml = dataset_root / f"hit_uav_{cfg.dataset_mode}.yaml"
+        if not dataset_yaml.is_file():
+            raise FileNotFoundError(
+                f"Dataset YAML not found: {dataset_yaml}\n"
+                "Run `python -m src.prepare_hituav` first!"
+            )
+        master_csv_name = "master_results.csv"
 
     local_project = local_work_dir / "runs"
     local_run_dir = local_project / cfg.exp_name
     drive_run_dir = (drive_dir / "runs" / cfg.exp_name) if drive_dir is not None else None
-    master_csv = (drive_dir / "results" / "master_results.csv") if drive_dir is not None else (local_work_dir / "master_results.csv")
+    master_csv = (
+        (drive_dir / "results" / master_csv_name)
+        if drive_dir is not None
+        else (local_work_dir / master_csv_name)
+    )
 
     print("\n" + "=" * 72)
     print(f"[RUN] Experiment: {cfg.exp_name} ({cfg.phase})")
@@ -161,36 +218,36 @@ def run_experiment(
 
     from src.modules import attach_phase1_callbacks, build_model_with_switches
 
-    # Auto-resolve frozen KD teacher checkpoint from local SSD or persistent Drive archive
+    # Auto-resolve frozen KD teacher checkpoint(s) from local SSD or persistent Drive archive
     if cfg.use_kd:
-        resolved_teacher: Optional[Path] = None
-        if cfg.kd_teacher_weights and Path(cfg.kd_teacher_weights).is_file():
-            resolved_teacher = Path(cfg.kd_teacher_weights)
-        elif cfg.kd_teacher_run:
-            search_candidates = [
-                local_project / cfg.kd_teacher_run / "weights" / "best.pt",
-            ]
-            if drive_dir is not None:
-                search_candidates.append(drive_dir / "runs" / cfg.kd_teacher_run / "weights" / "best.pt")
-            for cand in search_candidates:
-                if cand.is_file():
-                    if drive_dir is not None and cand.is_relative_to(drive_dir):
-                        cached_dir = local_work_dir / "teacher_cache" / cfg.kd_teacher_run
-                        cached_dir.mkdir(parents=True, exist_ok=True)
-                        cached_pt = cached_dir / "best.pt"
-                        if not cached_pt.is_file():
-                            shutil.copy2(cand, cached_pt)
-                        resolved_teacher = cached_pt
-                    else:
-                        resolved_teacher = cand
-                    break
-        if resolved_teacher is None:
-            raise FileNotFoundError(
-                f"KD teacher weights not found! Looked for weights='{cfg.kd_teacher_weights}' "
-                f"and run='{cfg.kd_teacher_run}' under {local_project} / {drive_dir}."
+        cfg.kd_teacher_weights = str(
+            _resolve_teacher_ckpt(
+                explicit_weights=cfg.kd_teacher_weights,
+                run_name=cfg.kd_teacher_run,
+                local_project=local_project,
+                local_work_dir=local_work_dir,
+                drive_dir=drive_dir,
+                tag="primary-IR",
             )
-        cfg.kd_teacher_weights = str(resolved_teacher)
-        print(f"[PHASE 3 KD] Resolved frozen teacher checkpoint: {resolved_teacher}")
+        )
+        if cfg.kd_aux_teacher_weights or cfg.kd_aux_teacher_run:
+            cfg.kd_aux_teacher_weights = str(
+                _resolve_teacher_ckpt(
+                    explicit_weights=cfg.kd_aux_teacher_weights,
+                    run_name=cfg.kd_aux_teacher_run,
+                    local_project=local_project,
+                    local_work_dir=local_work_dir,
+                    drive_dir=drive_dir,
+                    tag="aux-RGB",
+                )
+            )
+            if not cfg.kd_aux_rgb_root:
+                import yaml
+
+                y_cfg = yaml.safe_load(dataset_yaml.read_text(encoding="utf-8")) or {}
+                rgb_root = y_cfg.get("rgb_root") or str(dataset_root / "dronevehicle_rgb")
+                cfg.kd_aux_rgb_root = str(rgb_root)
+                print(f"[TRACK B] Resolved paired RGB dataset root: {cfg.kd_aux_rgb_root}")
 
     if skip_train_eval_only:
         train_minutes = 0.0
@@ -318,7 +375,7 @@ def main() -> None:
     parser.add_argument("--smoke-test", action="store_true", help="2-epoch fast sanity run (~60-90s).")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--optimizer", type=str, default=None)
-    parser.add_argument("--dataset-mode", type=str, choices=["4cls", "5cls"], default=None)
+    parser.add_argument("--dataset-mode", type=str, choices=["4cls", "5cls", "ir", "rgb"], default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--no-resume", action="store_true")
@@ -329,12 +386,24 @@ def main() -> None:
         print(list_presets())
         return
 
-    # Magic meta-preset: lets Colab Cell 1 run the full autonomous Phase 3 overnight
-    # decision tree via `EXP_LIST = ["auto_phase3_overnight"]` with ZERO notebook edits!
+    # Magic meta-presets: let Colab Cell 1 run full autonomous queues with ZERO notebook edits!
     if args.exp == "auto_phase3_overnight":
         from src.run_phase3_auto import run_overnight_orchestrator
 
         run_overnight_orchestrator(
+            dataset_root=args.dataset_root,
+            work_dir=args.work_dir,
+            drive_dir=args.drive_dir,
+            resume=not args.no_resume,
+            smoke_only=bool(args.smoke_test),
+            export_onnx=bool(args.export_onnx),
+        )
+        return
+    if args.exp in {"auto_dv_wave1", "auto_dv_wave2"}:
+        from src.run_dronevehicle_auto import run_dv_wave1, run_dv_wave2
+
+        fn = run_dv_wave1 if args.exp == "auto_dv_wave1" else run_dv_wave2
+        fn(
             dataset_root=args.dataset_root,
             work_dir=args.work_dir,
             drive_dir=args.drive_dir,

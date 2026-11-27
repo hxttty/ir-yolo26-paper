@@ -7,6 +7,7 @@ from .kd_yolo26 import (
     YOLO26KDConfig,
     attach_yolo26_kd_hook,
 )
+from .paired_rgbt_data import PairedRGBIRDataset, attach_paired_rgbt_dataloader_hook
 from .tc_gate import TCGateWrapper
 from .tcad import BiTCStemWrapper, TCADWrapper, extract_tcad_gate_stats
 from .v3_arch import BorderSafeBiTCStemWrapper, BorderSafeCAAResWrapper, HaarResWrapper

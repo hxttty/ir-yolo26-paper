@@ -201,11 +201,21 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
         )
         attach_v3_odcs_hook(model, odcs_cfg)
 
-    # Phase 3: Zero-Inference-Overhead Dual-Head & DFL-Free Knowledge Distillation
+    # Phase 3: Zero-Inference-Overhead Dual-Head & DFL-Free Knowledge Distillation (Track A & Track B)
     if cfg.use_kd:
+        if cfg.kd_aux_teacher_weights:
+            if not cfg.kd_aux_rgb_root:
+                raise ValueError(
+                    "Track B auxiliary RGB teacher is enabled, but `cfg.kd_aux_rgb_root` was not resolved!"
+                )
+            from src.modules.paired_rgbt_data import attach_paired_rgbt_dataloader_hook
+
+            attach_paired_rgbt_dataloader_hook(model, cfg.kd_aux_rgb_root)
+
         kd_cfg = YOLO26KDConfig(
             teacher_weights=str(cfg.kd_teacher_weights or ""),
             use_ema_teacher=cfg.kd_use_ema_teacher,
+            aux_teacher_weights=str(cfg.kd_aux_teacher_weights or ""),
             use_m1_feat=cfg.kd_use_m1_feat,
             feat_kd_mode=cfg.kd_feat_mode,
             use_m2_cross_o2o=cfg.kd_use_m2_cross_o2o,
@@ -216,6 +226,8 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
             kd_warmup_epochs=cfg.kd_warmup_epochs,
             kd_decay_frac=cfg.kd_decay_frac,
             kd_final_scale=cfg.kd_final_scale,
+            m2_start_epoch=cfg.kd_m2_start_epoch,
+            m2_warmup_epochs=cfg.kd_m2_warmup_epochs,
             stal_min_radius=cfg.kd_stal_min_radius,
             bg_weight=cfg.kd_bg_weight,
             cwd_tau=cfg.kd_cwd_tau,
@@ -237,9 +249,21 @@ def attach_phase1_callbacks(model: Any, cfg: ExperimentConfig) -> None:
             m3_o2o_weight=cfg.kd_m3_o2o_weight,
             m3_box_weight=cfg.kd_m3_box_weight,
             m3_cls_weight=cfg.kd_m3_cls_weight,
+            m3_o2o_intersect_student_fg=cfg.kd_m3_o2o_intersect_student_fg,
             use_runner_up_kd=cfg.kd_use_runner_up_kd,
             runner_up_weight=cfg.kd_runner_up_weight,
             use_soft_gt_blend=cfg.kd_use_soft_gt_blend,
+            lambda_cm_feat=cfg.kd_lambda_cm_feat,
+            lambda_cm_cls=cfg.kd_lambda_cm_cls,
+            use_night_circuit_breaker=cfg.kd_use_night_circuit_breaker,
+            use_dual_advantage_gate=cfg.kd_use_dual_advantage_gate,
+            cm_lowpass_feat=cfg.kd_cm_lowpass_feat,
+            cm_start_epoch=cfg.kd_cm_start_epoch,
+            cm_warmup_epochs=cfg.kd_cm_warmup_epochs,
+            night_mean_thresh=cfg.kd_night_mean_thresh,
+            night_std_thresh=cfg.kd_night_std_thresh,
+            cm_margin=cfg.kd_cm_margin,
+            cm_tau=cfg.kd_cm_tau,
         )
         attach_yolo26_kd_hook(model, kd_cfg)
 

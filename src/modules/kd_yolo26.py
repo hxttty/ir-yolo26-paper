@@ -50,9 +50,10 @@ import torch.nn.functional as F
 class YOLO26KDConfig:
     """Configuration for Phase 3 zero-inference-overhead YOLO26 knowledge distillation."""
 
-    # --- Teacher checkpoint ---
+    # --- Teacher checkpoint(s) ---
     teacher_weights: str = ""
     use_ema_teacher: bool = True
+    aux_teacher_weights: str = ""       # Track B: optional frozen RGB teacher for RGB+IR -> IR-only KD
 
     # --- Master pillar switches ---
     use_m1_feat: bool = True
@@ -65,8 +66,10 @@ class YOLO26KDConfig:
     lambda_cross: float = 0.5
     lambda_head: float = 1.0
     kd_warmup_epochs: int = 5
-    kd_decay_frac: float = 0.10         # Smooth cosine decay during final 10% epochs (clean GT polish)
-    kd_final_scale: float = 0.10        # Floor of r(t) at final epoch (0.0 = pure GT, 0.1 = gentle floor)
+    kd_decay_frac: float = 0.10         # Smooth cosine decay during final fraction of epochs (0.40 recommended in v2)
+    kd_final_scale: float = 0.10        # Floor of r(t) at final epoch (0.0 = pure GT polish)
+    m2_start_epoch: int = 0             # v2: set to 5 so M1 aligns 1x1 adapters before M2 hits frozen Teacher BN
+    m2_warmup_epochs: int = 5
 
     # --- M1 (F-PKD) parameters ---
     stal_min_radius: float = 1.0        # Grid-cell floor for Gaussian mask radius (preserves 8x10px targets)
@@ -95,6 +98,7 @@ class YOLO26KDConfig:
     m3_o2o_weight: float = 1.0          # Sparse O2O head KD weight (directly targets Δ_E2E)
     m3_box_weight: float = 1.0
     m3_cls_weight: float = 1.0
+    m3_o2o_intersect_student_fg: bool = True  # v2 fix: strictly intersect t_fg & s_fg to prevent O2O 1-to-1 tug-of-war!
     use_runner_up_kd: bool = True       # Soft Teacher-O2O runner-up calibration on O2M\O2O anchors
     runner_up_weight: float = 0.25
     use_soft_gt_blend: bool = False     # Optional blend b_soft = eta*b_T + (1-eta)*b_gt
@@ -103,7 +107,14 @@ class YOLO26KDConfig:
     adapter_lr_mult: float = 1.0
     adapter_weight_decay: float = 1e-4
 
-    # --- Track B (Privileged Cross-Modal RGB -> IR) safety gates ---
+    # --- Track B (Privileged Cross-Modal RGB + IR -> IR-only) switches & safety gates ---
+    lambda_cm_feat: float = 0.50        # Low-frequency structural RGB -> IR F-PKD weight
+    lambda_cm_cls: float = 0.25         # Advantage-gated RGB -> IR semantic classification KD weight (0 box KD!)
+    use_night_circuit_breaker: bool = True   # Spatially-aware night blackout circuit breaker (False = naive control)
+    use_dual_advantage_gate: bool = True     # Only distill RGB cls when q_rgb > q_ir + cm_margin (False = naive control)
+    cm_lowpass_feat: bool = True        # 3x3 AvgPool on RGB & student Neck to absorb 1-3 px lens parallax
+    cm_start_epoch: int = 3             # Delay cross-modal activation slightly while IR backbone stabilizes
+    cm_warmup_epochs: int = 5
     night_mean_thresh: float = 0.08     # Illumination safety switch: mu_rgb < 0.08 -> alpha_cm = 0
     night_std_thresh: float = 0.05      # Low-contrast switch: sigma_rgb < 0.05 -> alpha_cm = 0
     cm_margin: float = 0.03             # Auxiliary teacher advantage margin delta_m
@@ -132,6 +143,22 @@ def compute_kd_schedule(
     cos_val = 0.5 * (1.0 + math.cos(math.pi * prog))
     decay = float(final_scale) + (1.0 - float(final_scale)) * cos_val
     return w_up * decay
+
+
+def compute_delayed_ramp(
+    epoch: int,
+    *,
+    start_epoch: int = 0,
+    warmup_epochs: int = 5,
+) -> float:
+    """Delayed linear ramp in `[0, 1]` so adapters warm up under M1 before M2 / Track B engages."""
+    if start_epoch <= 0:
+        return 1.0
+    t = int(epoch)
+    if t < int(start_epoch):
+        return 0.0
+    w = max(int(warmup_epochs), 1)
+    return min(1.0, float(t - int(start_epoch) + 1) / float(w))
 
 
 def _dev_type(t: torch.Tensor) -> str:
@@ -232,17 +259,19 @@ def compute_fpkd_loss(
     bg_weight: float = 0.05,
     lowpass: bool = False,
     sample_weights: Optional[torch.Tensor] = None,
+    spatial_gate_maps: Optional[Sequence[torch.Tensor]] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """M1: Foreground-Focused Channel-Centered Pearson Correlation Distillation (F-PKD).
 
     Bounded in `[0, 2]`, invariant to thermal polarity inversion and teacher-student channel scale.
     Optional `lowpass=True` applies `3x3 AvgPool` to absorb 1-3 px RGB-IR parallax (Track B).
+    Optional `spatial_gate_maps` `(B, 1, H_l, W_l)` masks out dark nighttime / Mosaic quadrants.
     """
     dev = _dev_type(adapted_s[0])
     with torch.amp.autocast(device_type=dev, enabled=False):
         level_losses: List[torch.Tensor] = []
-        for fs, ft, st in zip(adapted_s, feats_t, strides):
+        for lvl_idx, (fs, ft, st) in enumerate(zip(adapted_s, feats_t, strides)):
             u = fs.float()
             v = ft.detach().float()
             if lowpass:
@@ -267,6 +296,8 @@ def compute_fpkd_loss(
             )
             if sample_weights is not None:
                 w_sp = w_sp * sample_weights.float().view(-1, 1, 1, 1)
+            if spatial_gate_maps is not None and lvl_idx < len(spatial_gate_maps):
+                w_sp = w_sp * spatial_gate_maps[lvl_idx].float()
 
             denom = w_sp.sum()
             if denom < 1e-4:
@@ -430,6 +461,41 @@ def compute_illumination_safety_switch(
         mu = x.mean(dim=(1, 2, 3))
         sigma = x.flatten(1).std(dim=1)
         safe = (mu >= float(mean_thresh)) & (sigma >= float(std_thresh))
+        return safe.float()
+
+
+def compute_spatial_illumination_mask(
+    rgb_img: torch.Tensor,
+    feat_hw: Tuple[int, int],
+    *,
+    stride: float = 8.0,
+    mean_thresh: float = 0.08,
+    std_thresh: float = 0.05,
+) -> torch.Tensor:
+    """Spatially-aware night-blackout circuit breaker `(B, 1, H_l, W_l)` in `{0.0, 1.0}`.
+
+    Computes local patch luminance mean & standard deviation over ~48-96 px receptive regions so
+    it cleanly blocks:
+      1. Pure nighttime dark RGB frames (`safe == 0` everywhere -> 100% pure IR teacher fallback), AND
+      2. Mixed Day+Night Mosaic quadrants or deep urban shadows (only well-lit regions pass!).
+    """
+    with torch.no_grad():
+        x = rgb_img.detach().float()
+        if x.max() > 1.5:
+            x = x / 255.0
+        lum = x.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+        fh, fw = int(feat_hw[0]), int(feat_hw[1])
+        # Exact feature-grid mean & second moment
+        e_x = F.adaptive_avg_pool2d(lum, (fh, fw))
+        e_x2 = F.adaptive_avg_pool2d(lum * lum, (fh, fw))
+        # Aggregate over a ~48-96 px local patch so single bright headlights do not fool dark quadrants
+        k = 5 if float(stride) <= 8.5 else 3
+        pad = k // 2
+        mu_local = F.avg_pool2d(e_x, kernel_size=k, stride=1, padding=pad)
+        ex2_local = F.avg_pool2d(e_x2, kernel_size=k, stride=1, padding=pad)
+        var_local = (ex2_local - mu_local * mu_local).clamp(min=0.0)
+        sigma_local = torch.sqrt(var_local + 1e-12)
+        safe = (mu_local >= float(mean_thresh)) & (sigma_local >= float(std_thresh))
         return safe.float()
 
 
@@ -632,19 +698,25 @@ class YOLO26DistillCriterion:
         base_criterion: Any,
         student_model: nn.Module,
         teacher_model: nn.Module,
-        adapters: NeckChannelAdapters,
+        adapters: Optional[NeckChannelAdapters],
         cfg: YOLO26KDConfig,
         *,
         expected_s_channels: Sequence[int],
         teacher_hook: Optional[_FeatureCaptureHook] = None,
+        aux_teacher_model: Optional[nn.Module] = None,
+        aux_adapters: Optional[NeckChannelAdapters] = None,
+        aux_teacher_hook: Optional[_FeatureCaptureHook] = None,
     ) -> None:
         self._base = base_criterion
         self._student_model = student_model
         self._teacher_model = teacher_model
         self._adapters = adapters
+        self._aux_teacher_model = aux_teacher_model
+        self._aux_adapters = aux_adapters
         self._kd_cfg = cfg
         self._expected_s_channels = [int(c) for c in expected_s_channels]
         self._teacher_hook = teacher_hook
+        self._aux_teacher_hook = aux_teacher_hook
         self._kd_epoch = 0
         self._kd_total_epochs = int(max(getattr(base_criterion.one2one.hyp, "epochs", 100), 1))
         self._verified_feats = False
@@ -664,6 +736,10 @@ class YOLO26DistillCriterion:
             "m1": float(avg[0]),
             "m2": float(avg[1]),
             "m3": float(avg[2]),
+            "cm_feat": float(avg[3]),
+            "cm_cls": float(avg[4]),
+            "illum_safe_frac": float(avg[5]),
+            "cm_gate_active_frac": float(avg[6]),
             "batches": int(self._epoch_kd_count),
         }
         self._epoch_kd_sum.zero_()
@@ -891,12 +967,18 @@ class YOLO26DistillCriterion:
         self,
         s_o2m: Dict[str, torch.Tensor],
         s_o2o: Dict[str, torch.Tensor],
+        s_o2m_fg: torch.Tensor,
         s_o2o_fg: torch.Tensor,
         t_assign: Dict[str, torch.Tensor],
         anchor_points: torch.Tensor,
         stride_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        """M3: Quality-Gated DFL-Free Dual-Head Calibration (O2M + O2O + Soft Runner-Up)."""
+        """M3: Quality-Gated DFL-Free Dual-Head Calibration (O2M + O2O + Soft Runner-Up).
+
+        v2 Fix (`m3_o2o_intersect_student_fg=True`): strictly intersects teacher & student positive
+        anchors (`t_fg & s_fg`) so M3 NEVER fights YOLO26's sparse 1-to-1 hard-negative GT BCE on
+        mismatched adjacent anchors!
+        """
         cfg = self._kd_cfg
         device = s_o2o["scores"].device
         zero = torch.zeros((), device=device, dtype=torch.float32)
@@ -972,6 +1054,12 @@ class YOLO26DistillCriterion:
 
                 return float(cfg.m3_box_weight) * l_box + float(cfg.m3_cls_weight) * l_cls
 
+            o2m_mask = t_assign["t_o2m_fg"]
+            o2o_mask = t_assign["t_o2o_fg"]
+            if cfg.m3_o2o_intersect_student_fg:
+                o2m_mask = o2m_mask & s_o2m_fg.bool()
+                o2o_mask = o2o_mask & s_o2o_fg.bool()
+
             loss_o2m = zero
             if float(cfg.m3_o2m_weight) > 0.0:
                 loss_o2m = _head_branch_loss(
@@ -981,7 +1069,7 @@ class YOLO26DistillCriterion:
                     t_assign["t_o2m_boxes"],
                     t_assign["t_o2m_labels"],
                     t_assign["t_o2m_gt_px"],
-                    t_assign["t_o2m_fg"],
+                    o2m_mask,
                 )
 
             loss_o2o = zero
@@ -993,7 +1081,7 @@ class YOLO26DistillCriterion:
                     t_assign["t_o2o_boxes"],
                     t_assign["t_o2o_labels"],
                     t_assign["t_o2o_gt_px"],
-                    t_assign["t_o2o_fg"],
+                    o2o_mask,
                 )
 
             # Soft Teacher-O2O runner-up calibration on `T_O2M \ (T_O2O ∪ S_O2O)` (zero GT conflict!)
@@ -1015,14 +1103,184 @@ class YOLO26DistillCriterion:
                 + float(cfg.runner_up_weight) * loss_run
             )
 
+    def _compute_track_b_cm_kd(
+        self,
+        rgb_img: torch.Tensor,
+        s_feats: Sequence[torch.Tensor],
+        s_o2m: Dict[str, torch.Tensor],
+        s_o2o: Dict[str, torch.Tensor],
+        s_o2m_fg: torch.Tensor,
+        s_o2o_fg: torch.Tensor,
+        t_assign: Dict[str, torch.Tensor],
+        gt_bboxes_px: torch.Tensor,
+        mask_gt: torch.Tensor,
+        anchor_points: torch.Tensor,
+        stride_tensor: torch.Tensor,
+        strides_list: Sequence[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Track B: Night-Safe Decoupled Dual-Teacher Privileged Cross-Modal (`RGB + IR -> IR-only`) KD.
+
+        Returns `(l_cm_feat, l_cm_cls, illum_safe_frac, cm_gate_active_frac)`:
+          - Uses Spatially-Aware Illumination Circuit Breaker to mask dark RGB frames & Mosaic quadrants.
+          - Distills low-frequency (`3x3 AvgPool`) structural Neck features + dual-teacher advantage-gated
+            semantic classification ONLY (`q_rgb > q_ir + cm_margin`), keeping box regression strictly
+            anchored to IR teacher/GT (zero 1-3 px RGB-IR parallax drift!).
+        """
+        cfg = self._kd_cfg
+        device = s_feats[0].device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        if self._aux_teacher_model is None:
+            return zero, zero, zero, zero
+
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=_dev_type(rgb_img), enabled=False):
+                aux_out = self._aux_teacher_model(rgb_img)
+            parsed_aux = self._parse_raw_e2e(aux_out)
+            aux_o2m, aux_o2o = parsed_aux["one2many"], parsed_aux["one2one"]
+            aux_feats = self._aux_teacher_hook.pop() if self._aux_teacher_hook is not None else None
+            if aux_feats is None:
+                aux_feats = aux_o2m["feats"]
+
+            # Spatially-aware illumination safety maps `(B, 1, H_l, W_l)` per FPN scale
+            safe_maps: List[torch.Tensor] = []
+            for f_s, st in zip(s_feats, strides_list):
+                fh, fw = int(f_s.shape[2]), int(f_s.shape[3])
+                if cfg.use_night_circuit_breaker:
+                    sm = compute_spatial_illumination_mask(
+                        rgb_img,
+                        (fh, fw),
+                        stride=float(st),
+                        mean_thresh=cfg.night_mean_thresh,
+                        std_thresh=cfg.night_std_thresh,
+                    )
+                else:
+                    sm = torch.ones((rgb_img.shape[0], 1, fh, fw), device=device, dtype=torch.float32)
+                safe_maps.append(sm)
+            illum_safe_frac = torch.stack([m.mean() for m in safe_maps]).mean()
+
+        # 1. Low-frequency structural RGB -> IR feature alignment (absorbs 1-3 px parallax)
+        l_cm_feat = zero
+        if float(cfg.lambda_cm_feat) > 0.0 and self._aux_adapters is not None:
+            with torch.amp.autocast(device_type=_dev_type(s_feats[0]), enabled=False):
+                aux_adapted = self._aux_adapters(s_feats)
+                l_cm_feat = compute_fpkd_loss(
+                    aux_adapted,
+                    aux_feats,
+                    gt_bboxes_px,
+                    mask_gt,
+                    strides_list,
+                    min_radius=cfg.stal_min_radius,
+                    bg_weight=cfg.bg_weight,
+                    lowpass=cfg.cm_lowpass_feat,
+                    spatial_gate_maps=safe_maps,
+                )
+
+        # 2. Dual-teacher advantage-gated semantic classification calibration (ZERO RGB box regression!)
+        l_cm_cls = zero
+        gate_active_frac = zero
+        if float(cfg.lambda_cm_cls) > 0.0:
+            with torch.amp.autocast(device_type=_dev_type(rgb_img), enabled=False):
+                safe_anchors = torch.cat([sm.flatten(1) for sm in safe_maps], dim=1)  # (B, total_anchors)
+                anchors_f = anchor_points.float()
+                strides_f = stride_tensor.float()
+
+                def _cm_cls_branch(
+                    s_pred: Dict[str, torch.Tensor],
+                    branch_loss_obj: Any,
+                    t_ir_scores_all: torch.Tensor,
+                    t_ir_boxes_all: torch.Tensor,
+                    t_ir_labels_all: torch.Tensor,
+                    t_ir_gt_px_all: torch.Tensor,
+                    aux_pred: Dict[str, torch.Tensor],
+                    fg_mask: torch.Tensor,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                    if not fg_mask.any():
+                        return zero, zero
+                    b_idx, a_idx = fg_mask.nonzero(as_tuple=True)
+                    n = b_idx.numel()
+                    idx = torch.arange(n, device=device)
+
+                    s_scores = s_pred["scores"].permute(0, 2, 1).contiguous().float()
+                    s_sc_pos = s_scores[b_idx, a_idx]
+
+                    with torch.no_grad():
+                        aux_dist = aux_pred["boxes"].permute(0, 2, 1).contiguous().float()
+                        aux_scores = aux_pred["scores"].permute(0, 2, 1).contiguous().float()
+                        aux_boxes = branch_loss_obj.bbox_decode(anchors_f, aux_dist)
+
+                        aux_sc_pos = aux_scores[b_idx, a_idx]
+                        aux_bx_pos = aux_boxes[b_idx, a_idx]
+                        ir_sc_pos = t_ir_scores_all[b_idx, a_idx]
+                        ir_bx_pos = t_ir_boxes_all[b_idx, a_idx]
+                        gt_lbl_pos = t_ir_labels_all[b_idx, a_idx].clamp(0, s_sc_pos.shape[-1] - 1)
+                        gt_grid = t_ir_gt_px_all[b_idx, a_idx] / strides_f[a_idx]
+                        safe_pos = safe_anchors[b_idx, a_idx]
+
+                        if cfg.use_dual_advantage_gate:
+                            p_ir = ir_sc_pos.sigmoid()[idx, gt_lbl_pos]
+                            iou_ir = compute_box_iou_variants_fp32(ir_bx_pos, gt_grid, mode="iou")
+                            q_ir = p_ir * iou_ir
+
+                            p_rgb = aux_sc_pos.sigmoid()[idx, gt_lbl_pos]
+                            iou_rgb = compute_box_iou_variants_fp32(aux_bx_pos, gt_grid, mode="iou")
+                            q_rgb = p_rgb * iou_rgb
+
+                            g_cm = compute_dual_teacher_advantage_gate(
+                                q_ir,
+                                q_rgb,
+                                margin=cfg.cm_margin,
+                                tau=cfg.cm_tau,
+                                image_safe=safe_pos,
+                            )
+                        else:
+                            g_cm = safe_pos
+
+                        act = (g_cm > 1e-4).float().mean()
+                    g_sum = g_cm.sum()
+                    if g_sum < 1e-4:
+                        return zero, act
+                    loss_c = (
+                        compute_soft_bce_kd(s_sc_pos, aux_sc_pos, tau=cfg.cls_tau) * g_cm
+                    ).sum() / g_sum.clamp(min=1e-6)
+                    return loss_c, act
+
+                o2m_mask = t_assign["t_o2m_fg"] & s_o2m_fg.bool()
+                o2o_mask = t_assign["t_o2o_fg"] & s_o2o_fg.bool()
+                lc_o2m, act_o2m = _cm_cls_branch(
+                    s_o2m,
+                    self._base.one2many,
+                    t_assign["t_o2m_scores"],
+                    t_assign["t_o2m_boxes"],
+                    t_assign["t_o2m_labels"],
+                    t_assign["t_o2m_gt_px"],
+                    aux_o2m,
+                    o2m_mask,
+                )
+                lc_o2o, act_o2o = _cm_cls_branch(
+                    s_o2o,
+                    self._base.one2one,
+                    t_assign["t_o2o_scores"],
+                    t_assign["t_o2o_boxes"],
+                    t_assign["t_o2o_labels"],
+                    t_assign["t_o2o_gt_px"],
+                    aux_o2o,
+                    o2o_mask,
+                )
+                l_cm_cls = 0.5 * lc_o2m + 1.0 * lc_o2o
+                gate_active_frac = 0.5 * (act_o2m + act_o2o)
+
+        return l_cm_feat, l_cm_cls, illum_safe_frac, gate_active_frac
+
     def __call__(
         self,
         preds: Any,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # Always clear teacher capture buffer cleanly even if validation or error occurs
+        # Always clear teacher capture buffers cleanly even if validation or error occurs
         if self._teacher_hook is not None:
             self._teacher_hook.pop()
+        if self._aux_teacher_hook is not None:
+            self._aux_teacher_hook.pop()
 
         base = self._base
         parsed_s = self._parse_raw_e2e(preds)
@@ -1037,13 +1295,14 @@ class YOLO26DistillCriterion:
         bs = s_o2m["boxes"].shape[0]
         device = s_o2m["boxes"].device
 
-        # 1. Exact native YOLO26 E2ELoss computation (captures `s_o2o_fg` cleanly without extra forward)
-        _, loss_o2m_raw, _ = base.one2many.get_assigned_targets_and_loss(s_o2m, batch)
+        # 1. Exact native YOLO26 E2ELoss computation (captures BOTH `s_o2m_fg` and `s_o2o_fg` cleanly!)
+        o2m_assigned, loss_o2m_raw, _ = base.one2many.get_assigned_targets_and_loss(s_o2m, batch)
         o2o_assigned, loss_o2o_raw, loss_o2o_detach = base.one2one.get_assigned_targets_and_loss(s_o2o, batch)
+        s_o2m_fg = o2m_assigned[0]
         s_o2o_fg = o2o_assigned[0]
         base_total = (loss_o2m_raw * bs) * base.o2m + (loss_o2o_raw * bs) * base.o2o
 
-        # 2. Schedule factor r(t)
+        # 2. Schedule factor r(t) + delayed warmup ramps for M2 & Track B
         cfg = self._kd_cfg
         r_t = compute_kd_schedule(
             self._kd_epoch,
@@ -1055,6 +1314,22 @@ class YOLO26DistillCriterion:
         self._last_r_t = float(r_t)
         if r_t <= 1e-6 or "img" not in batch:
             return base_total, loss_o2o_detach
+
+        # During 2-epoch smoke tests, force delayed branches ON so Gate 1 exercises every enabled path!
+        if self._kd_total_epochs <= 2:
+            r_m2 = 1.0
+            r_cm = 1.0
+        else:
+            r_m2 = compute_delayed_ramp(
+                self._kd_epoch,
+                start_epoch=cfg.m2_start_epoch,
+                warmup_epochs=cfg.m2_warmup_epochs,
+            )
+            r_cm = compute_delayed_ramp(
+                self._kd_epoch,
+                start_epoch=cfg.cm_start_epoch,
+                warmup_epochs=cfg.cm_warmup_epochs,
+            )
 
         # Directly consume un-detached Neck features `s_o2m["feats"]` (zero forward hook on student!)
         s_feats = s_o2m["feats"]
@@ -1068,7 +1343,7 @@ class YOLO26DistillCriterion:
                 raise RuntimeError("Student `one2many['feats']` is detached; Backbone/Neck KD gradients would be blocked.")
             self._verified_feats = True
 
-        # 3. Frozen teacher forward on identical batch["img"] (zero host-device sync)
+        # 3. Frozen primary IR teacher forward on identical batch["img"] (zero host-device sync)
         raw_img = batch["img"]
         if raw_img.dtype == torch.uint8:
             img = raw_img.to(device=device, dtype=torch.float32, non_blocking=True) / 255.0
@@ -1093,11 +1368,12 @@ class YOLO26DistillCriterion:
         targets = base.one2many.preprocess(targets.to(device), bs, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes_px = targets.split((1, 4), 2)
         mask_gt = gt_bboxes_px.sum(2, keepdim=True).gt(0.0)
+        strides_list = [float(s) for s in base.one2many.stride.tolist()]
 
         # 5. Compute adapted student Neck features once (shared by M1 & M2!)
-        need_adapter = (cfg.use_m1_feat and cfg.feat_kd_mode != "none") or cfg.use_m2_cross_o2o
+        need_adapter = (cfg.use_m1_feat and cfg.feat_kd_mode != "none") or (cfg.use_m2_cross_o2o and r_m2 > 0.0)
         adapted_feats: Optional[List[torch.Tensor]] = None
-        if need_adapter:
+        if need_adapter and self._adapters is not None:
             with torch.amp.autocast(device_type=_dev_type(s_feats[0]), enabled=False):
                 adapted_feats = self._adapters(s_feats)
 
@@ -1105,7 +1381,6 @@ class YOLO26DistillCriterion:
         zero = torch.zeros((), device=device, dtype=torch.float32)
         l_m1 = zero
         if cfg.use_m1_feat and cfg.feat_kd_mode != "none" and adapted_feats is not None:
-            strides_list = [float(s) for s in base.one2many.stride.tolist()]
             if cfg.feat_kd_mode == "fpkd":
                 l_m1 = compute_fpkd_loss(
                     adapted_feats,
@@ -1124,9 +1399,14 @@ class YOLO26DistillCriterion:
             else:
                 raise ValueError(f"Unknown feat_kd_mode: {cfg.feat_kd_mode}")
 
-        # --- Teacher Assignments (shared by M2 & M3) ---
+        # --- Teacher Assignments (shared by M2, M3 & Track B) ---
+        need_t_assign = (
+            (cfg.use_m2_cross_o2o and r_m2 > 0.0)
+            or cfg.use_m3_qg_head
+            or (self._aux_teacher_model is not None and r_cm > 0.0 and float(cfg.lambda_cm_cls) > 0.0)
+        )
         t_assign: Optional[Dict[str, torch.Tensor]] = None
-        if cfg.use_m2_cross_o2o or cfg.use_m3_qg_head:
+        if need_t_assign:
             t_assign = self._compute_teacher_assignments(
                 t_o2m,
                 t_o2o,
@@ -1137,32 +1417,72 @@ class YOLO26DistillCriterion:
                 stride_tensor,
             )
 
-        # --- M2: CrossKD-O2O (bypasses `x_detach`) ---
+        # --- M2: CrossKD-O2O (bypasses `x_detach`, starts cleanly after M1 adapter warmup!) ---
         l_m2 = zero
-        if cfg.use_m2_cross_o2o and adapted_feats is not None and t_assign is not None:
+        if cfg.use_m2_cross_o2o and r_m2 > 0.0 and adapted_feats is not None and t_assign is not None:
             l_m2 = self._compute_m2_cross_o2o(adapted_feats, t_assign, anchor_points, stride_tensor)
 
-        # --- M3: QG-Head (DFL-free QG-CIoU-L1 + Dual-Head Cls) ---
+        # --- M3: QG-Head (DFL-free QG-CIoU-L1 + Dual-Head Cls, strictly intersected with s_fg!) ---
         l_m3 = zero
         if cfg.use_m3_qg_head and t_assign is not None:
-            l_m3 = self._compute_m3_qg_head(s_o2m, s_o2o, s_o2o_fg, t_assign, anchor_points, stride_tensor)
+            l_m3 = self._compute_m3_qg_head(
+                s_o2m, s_o2o, s_o2m_fg, s_o2o_fg, t_assign, anchor_points, stride_tensor
+            )
+
+        # --- Track B: Night-Safe Decoupled Dual-Teacher Privileged Cross-Modal (`RGB + IR -> IR-only`) ---
+        l_cm_feat, l_cm_cls, illum_safe_frac, cm_gate_frac = zero, zero, zero, zero
+        if self._aux_teacher_model is not None and r_cm > 0.0:
+            if "rgb_img" not in batch:
+                raise KeyError(
+                    "Track B dual-teacher KD requires synchronized `batch['rgb_img']` from PairedRGBIRDataset!"
+                )
+            raw_rgb = batch["rgb_img"]
+            if raw_rgb.dtype == torch.uint8:
+                rgb_img = raw_rgb.to(device=device, dtype=torch.float32, non_blocking=True) / 255.0
+            else:
+                rgb_img = raw_rgb.to(device=device, dtype=torch.float32, non_blocking=True)
+            assert t_assign is not None or float(cfg.lambda_cm_cls) <= 0.0
+            l_cm_feat, l_cm_cls, illum_safe_frac, cm_gate_frac = self._compute_track_b_cm_kd(
+                rgb_img,
+                s_feats,
+                s_o2m,
+                s_o2o,
+                s_o2m_fg,
+                s_o2o_fg,
+                t_assign if t_assign is not None else {},
+                gt_bboxes_px,
+                mask_gt,
+                anchor_points,
+                stride_tensor,
+                strides_list,
+            )
 
         # Combine into Ultralytics 3-slot loss tensor `[box, cls, l1]` * batch_size
         # Strict fail-fast on non-finite KD losses (NEVER silently degrade into pure-detection training!)
-        kd_m1_s = r_t * float(cfg.lambda_feat) * l_m1
-        kd_m2_s = r_t * float(cfg.lambda_cross) * l_m2
-        kd_m3_s = r_t * float(cfg.lambda_head) * l_m3
+        kd_m1_s = r_t * (float(cfg.lambda_feat) * l_m1 + r_cm * float(cfg.lambda_cm_feat) * l_cm_feat)
+        kd_m2_s = r_t * r_m2 * float(cfg.lambda_cross) * l_m2
+        kd_m3_s = r_t * (float(cfg.lambda_head) * l_m3 + r_cm * float(cfg.lambda_cm_cls) * l_cm_cls)
         parts = torch.stack((kd_m3_s, kd_m2_s, kd_m1_s))
         if not torch.isfinite(parts).all():
             raise FloatingPointError(
-                f"Non-finite KD loss at epoch={self._kd_epoch}: [M3,M2,M1]={parts.detach().cpu().tolist()}"
+                f"Non-finite KD loss at epoch={self._kd_epoch}: [M3+CMc,M2,M1+CMf]={parts.detach().cpu().tolist()}"
             )
         total_loss = base_total + parts.to(base_total.dtype) * bs
 
         # Device-side epoch accumulator (zero per-batch GPU->CPU sync!)
         if self._epoch_kd_sum is None:
-            self._epoch_kd_sum = torch.zeros(3, device=device, dtype=torch.float32)
-        self._epoch_kd_sum += torch.stack((l_m1.detach(), l_m2.detach(), l_m3.detach())).float()
+            self._epoch_kd_sum = torch.zeros(7, device=device, dtype=torch.float32)
+        self._epoch_kd_sum += torch.stack(
+            (
+                l_m1.detach(),
+                l_m2.detach(),
+                l_m3.detach(),
+                l_cm_feat.detach(),
+                l_cm_cls.detach(),
+                illum_safe_frac.detach(),
+                cm_gate_frac.detach(),
+            )
+        ).float()
         self._epoch_kd_count += 1
         self._total_kd_batches += 1
         return total_loss, loss_o2o_detach
@@ -1173,15 +1493,18 @@ class YOLO26DistillCriterion:
 # ---------------------------------------------------------------------------
 
 def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
-    """Attach Phase 3 zero-inference-overhead KD hooks to an Ultralytics `YOLO` instance."""
-    if not (cfg.use_m1_feat or cfg.use_m2_cross_o2o or cfg.use_m3_qg_head):
+    """Attach Phase 3 zero-inference-overhead KD hooks (Track A IR->IR & Track B RGB+IR->IR)."""
+    has_track_b = bool(cfg.aux_teacher_weights)
+    if not (cfg.use_m1_feat or cfg.use_m2_cross_o2o or cfg.use_m3_qg_head or has_track_b):
         return
     if not cfg.teacher_weights:
         raise ValueError("YOLO26KDConfig.teacher_weights must be set when KD is enabled.")
 
     state: Dict[str, Any] = {
         "teacher": None,
+        "aux_teacher": None,
         "adapters": None,
+        "aux_adapters": None,
         "adapter_opt": None,
         "criterion": None,
         "base_criterion": None,
@@ -1189,6 +1512,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         "handles": [],
         "adapter_steps": 0,
         "teacher_sig": "",
+        "aux_teacher_sig": "",
     }
 
     def _on_train_start(trainer: Any) -> None:
@@ -1205,15 +1529,35 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         t_ch = _infer_detect_in_channels(teacher)
         adapters = NeckChannelAdapters(s_ch, t_ch).to(device)
 
-        # Dedicated AdamW for adapters: completely isolated from `MuSGD` Newton-Schulz & `LambdaLR`
+        aux_teacher: Optional[nn.Module] = None
+        aux_adapters: Optional[NeckChannelAdapters] = None
+        aux_hook: Optional[_FeatureCaptureHook] = None
+        aux_sig = ""
+        handles: List[Any] = []
+
+        if cfg.aux_teacher_weights:
+            aux_path = Path(cfg.aux_teacher_weights)
+            aux_teacher = load_frozen_teacher(aux_path, device, use_ema=cfg.use_ema_teacher)
+            validate_teacher_compatibility(raw_model, aux_teacher)
+            aux_sig = f"{aux_path.name}:{aux_path.stat().st_size}"
+            state["aux_teacher_sig"] = aux_sig
+            aux_ch = _infer_detect_in_channels(aux_teacher)
+            aux_adapters = NeckChannelAdapters(s_ch, aux_ch).to(device)
+            aux_hook = _FeatureCaptureHook(detach=True)
+            handles.append(aux_teacher.model[-1].register_forward_pre_hook(aux_hook))
+
+        # Dedicated AdamW for all train-only adapters: isolated from `MuSGD` Newton-Schulz & `LambdaLR`
         base_lr = float(trainer.optimizer.param_groups[0]["lr"])
+        all_adapter_params = list(adapters.parameters())
+        if aux_adapters is not None:
+            all_adapter_params += list(aux_adapters.parameters())
         adapter_opt = torch.optim.AdamW(
-            adapters.parameters(),
+            all_adapter_params,
             lr=base_lr * float(cfg.adapter_lr_mult),
             weight_decay=float(cfg.adapter_weight_decay),
         )
 
-        # Restore BOTH adapters and adapter_opt from `kd_state.pt` when resuming an interrupted run
+        # Restore BOTH adapters (+ aux_adapters) and adapter_opt from `kd_state.pt` when resuming
         save_dir = Path(getattr(trainer, "save_dir", "."))
         kd_state_ckpt = save_dir / "weights" / "kd_state.pt"
         if getattr(trainer.args, "resume", False) and kd_state_ckpt.is_file():
@@ -1222,7 +1566,14 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
                 saved_sig = kd_st.get("teacher_sig", "")
                 if saved_sig and saved_sig != teacher_sig:
                     raise ValueError(f"Teacher mismatch on resume: saved={saved_sig} vs current={teacher_sig}")
+                saved_aux_sig = kd_st.get("aux_teacher_sig", "")
+                if aux_sig and saved_aux_sig and saved_aux_sig != aux_sig:
+                    raise ValueError(
+                        f"Aux RGB teacher mismatch on resume: saved={saved_aux_sig} vs current={aux_sig}"
+                    )
                 adapters.load_state_dict(kd_st["adapters"])
+                if aux_adapters is not None and "aux_adapters" in kd_st and kd_st["aux_adapters"] is not None:
+                    aux_adapters.load_state_dict(kd_st["aux_adapters"])
                 if "adapter_opt" in kd_st:
                     adapter_opt.load_state_dict(kd_st["adapter_opt"])
                 print(
@@ -1232,12 +1583,14 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
             except Exception as exc:
                 raise RuntimeError(f"Failed restoring KD resume state from {kd_state_ckpt}: {exc}") from exc
 
-        # Pre-hook ONLY on frozen teacher (ZERO hooks attached to student_model -> immune to NaN EMA rebuild!)
+        # Pre-hook ONLY on frozen teacher(s) (ZERO hooks on student_model -> immune to NaN EMA rebuild!)
         t_hook = _FeatureCaptureHook(detach=True)
-        h_t = teacher.model[-1].register_forward_pre_hook(t_hook)
-        state["handles"] = [h_t]
+        handles.append(teacher.model[-1].register_forward_pre_hook(t_hook))
+        state["handles"] = handles
         state["teacher"] = teacher
+        state["aux_teacher"] = aux_teacher
         state["adapters"] = adapters
+        state["aux_adapters"] = aux_adapters
         state["adapter_opt"] = adapter_opt
 
         # Initialize native criterion eagerly & replace with deepcopy-safe KD wrapper
@@ -1254,6 +1607,9 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
             cfg,
             expected_s_channels=s_ch,
             teacher_hook=t_hook,
+            aux_teacher_model=aux_teacher,
+            aux_adapters=aux_adapters,
+            aux_teacher_hook=aux_hook,
         )
         kd_crit._kd_total_epochs = int(max(getattr(trainer, "epochs", 100), 1))
         kd_crit._kd_epoch = int(getattr(trainer, "epoch", 0))
@@ -1265,7 +1621,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         state["orig_opt_step"] = orig_opt_step
 
         def _wrapped_optimizer_step() -> None:
-            has_grad = any(p.grad is not None for p in adapters.parameters())
+            has_grad = any(p.grad is not None for p in all_adapter_params)
             if has_grad:
                 if getattr(trainer, "optimizer", None) is not None:
                     cur_lr = float(trainer.optimizer.param_groups[0]["lr"]) * float(cfg.adapter_lr_mult)
@@ -1274,10 +1630,10 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
                 scaler = getattr(trainer, "scaler", None)
                 if scaler is not None:
                     scaler.unscale_(adapter_opt)
-                    torch.nn.utils.clip_grad_norm_(adapters.parameters(), max_norm=10.0)
+                    torch.nn.utils.clip_grad_norm_(all_adapter_params, max_norm=10.0)
                     scaler.step(adapter_opt)
                 else:
-                    torch.nn.utils.clip_grad_norm_(adapters.parameters(), max_norm=10.0)
+                    torch.nn.utils.clip_grad_norm_(all_adapter_params, max_norm=10.0)
                     adapter_opt.step()
                 state["adapter_steps"] += 1
                 adapter_opt.zero_grad(set_to_none=True)
@@ -1285,13 +1641,22 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
 
         trainer.optimizer_step = _wrapped_optimizer_step
 
-        n_adapt_params = sum(p.numel() for p in adapters.parameters())
+        n_adapt_params = sum(p.numel() for p in all_adapter_params)
+        track_b_str = (
+            f" | TrackB_RGB={Path(cfg.aux_teacher_weights).name}"
+            f"(wf={cfg.lambda_cm_feat}, wc={cfg.lambda_cm_cls}, night_cb={cfg.use_night_circuit_breaker}, "
+            f"adv_gate={cfg.use_dual_advantage_gate}, lp={cfg.cm_lowpass_feat})"
+            if aux_teacher is not None
+            else ""
+        )
         print(
             f"[PHASE 3 KD] Attached zero-latency YOLO26 KD | teacher={teacher_path.name} "
             f"| ch: {s_ch} -> {t_ch} (adapters={n_adapt_params:,} train-only params, +0 inference params) "
             f"| M1={cfg.use_m1_feat}:{cfg.feat_kd_mode}(w={cfg.lambda_feat}) "
-            f"| M2_CrossO2O={cfg.use_m2_cross_o2o}(w={cfg.lambda_cross}, sup={cfg.cross_sup_weight}) "
-            f"| M3_QGHead={cfg.use_m3_qg_head}:{cfg.box_kd_mode}(w={cfg.lambda_head}, run={cfg.use_runner_up_kd})"
+            f"| M2_CrossO2O={cfg.use_m2_cross_o2o}(w={cfg.lambda_cross}, start={cfg.m2_start_epoch}) "
+            f"| M3_QGHead={cfg.use_m3_qg_head}:{cfg.box_kd_mode}(w={cfg.lambda_head}, "
+            f"cls_w={cfg.m3_cls_weight}, inter={cfg.m3_o2o_intersect_student_fg}, run={cfg.use_runner_up_kd})"
+            f"{track_b_str}"
         )
 
     def _on_train_epoch_start(trainer: Any) -> None:
@@ -1310,14 +1675,21 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         epoch_idx = int(getattr(trainer, "epoch", 0)) + 1
         if crit is not None:
             st = crit.flush_epoch_kd_stats()
-            if st and (epoch_idx <= 2 or epoch_idx % 10 == 0):
+            if st and (epoch_idx <= 2 or epoch_idx == 6 or epoch_idx % 10 == 0):
+                cm_str = (
+                    f" | CM_F={st['cm_feat']:.4f} CM_C={st['cm_cls']:.4f} "
+                    f"(safe={st['illum_safe_frac']*100:.1f}%, gate={st['cm_gate_active_frac']*100:.1f}%)"
+                    if state.get("aux_teacher") is not None
+                    else ""
+                )
                 print(
                     f"[PHASE 3 KD][Ep {epoch_idx}] r(t)={st['r_t']:.2f} | "
-                    f"M1={st['m1']:.4f} | M2={st['m2']:.4f} | M3={st['m3']:.4f} "
+                    f"M1={st['m1']:.4f} | M2={st['m2']:.4f} | M3={st['m3']:.4f}{cm_str} "
                     f"(batches={st['batches']}, adapter_steps={state['adapter_steps']})"
                 )
-        # Save exact-epoch `kd_state.pt` (~0.8MB, <5ms) alongside `last.pt` for lossless resume
+        # Save exact-epoch `kd_state.pt` alongside `last.pt` for lossless resume
         adapters = state.get("adapters")
+        aux_adapters = state.get("aux_adapters")
         adapter_opt = state.get("adapter_opt")
         if adapters is not None and adapter_opt is not None:
             try:
@@ -1327,7 +1699,9 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
                     {
                         "epoch": epoch_idx,
                         "teacher_sig": state["teacher_sig"],
+                        "aux_teacher_sig": state["aux_teacher_sig"],
                         "adapters": adapters.state_dict(),
+                        "aux_adapters": aux_adapters.state_dict() if aux_adapters is not None else None,
                         "adapter_opt": adapter_opt.state_dict(),
                     },
                     str(w_dir / "kd_state.pt"),
@@ -1349,11 +1723,17 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         try:
             health = {
                 "teacher_sig": state.get("teacher_sig", ""),
+                "aux_teacher_sig": state.get("aux_teacher_sig", ""),
+                "track_b_enabled": state.get("aux_teacher") is not None,
                 "adapter_steps": int(state.get("adapter_steps", 0)),
                 "total_kd_batches": int(getattr(crit, "_total_kd_batches", 0)) if crit is not None else 0,
                 "last_epoch_avg_kd": getattr(crit, "_last_epoch_avg_kd", {}) if crit is not None else {},
                 "peak_vram_gb": peak_vram_gb,
-                "needs_adapters": bool((cfg.use_m1_feat and cfg.feat_kd_mode != "none") or cfg.use_m2_cross_o2o),
+                "needs_adapters": bool(
+                    (cfg.use_m1_feat and cfg.feat_kd_mode != "none")
+                    or cfg.use_m2_cross_o2o
+                    or (state.get("aux_teacher") is not None and float(cfg.lambda_cm_feat) > 0.0)
+                ),
             }
             out_p = Path(trainer.save_dir) / "kd_health.json"
             out_p.write_text(json.dumps(health, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1364,7 +1744,7 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
         except Exception as exc:
             print(f"[WARN] Could not write kd_health.json: {exc}")
 
-        # Clean teardown: restore native criterion & optimizer_step, release teacher/adapters VRAM
+        # Clean teardown: restore native criterion & optimizer_step, release teacher(s)/adapters VRAM
         if state.get("base_criterion") is not None:
             raw_model.criterion = state["base_criterion"]
         if state.get("orig_opt_step") is not None:
@@ -1376,7 +1756,9 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
                 pass
         state["handles"] = []
         state["teacher"] = None
+        state["aux_teacher"] = None
         state["adapters"] = None
+        state["aux_adapters"] = None
         state["adapter_opt"] = None
         state["criterion"] = None
         if torch.cuda.is_available():
