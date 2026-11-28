@@ -129,6 +129,11 @@ class YOLO26KDConfig:
     night_std_thresh: float = 0.05      # Low-contrast switch: sigma_rgb < 0.05 -> alpha_cm = 0
     cm_margin: float = 0.03             # Auxiliary teacher advantage margin delta_m
     cm_tau: float = 0.20                # Softmax temperature tau_m for dual-teacher preference gate
+    cm_illum_mode: str = "legacy_spatial"
+    night_q50_thresh: float = 0.15
+    night_macro_std_thresh: float = 0.025
+    cm_feat_quality_gate: bool = False
+    cm_cls_fg_norm: bool = False
 
 
 def compute_kd_schedule(
@@ -279,6 +284,7 @@ def compute_fpkd_loss(
     sample_weights: Optional[torch.Tensor] = None,
     spatial_gate_maps: Optional[Sequence[torch.Tensor]] = None,
     precomputed_fg_maps: Optional[Sequence[torch.Tensor]] = None,
+    denom_mode: str = "gated",
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """M1: Foreground-Focused Channel-Centered Pearson Correlation Distillation (F-PKD).
@@ -286,7 +292,10 @@ def compute_fpkd_loss(
     Bounded in `[0, 2]`, invariant to thermal polarity inversion and teacher-student channel scale.
     Optional `lowpass=True` applies `3x3 AvgPool` to absorb 1-3 px RGB-IR parallax (Track B).
     Optional `spatial_gate_maps` `(B, 1, H_l, W_l)` masks out dark nighttime / Mosaic quadrants.
+    With `fg_only`, the pre-gate foreground mass (including sample weights) sets the scale.
     """
+    if denom_mode not in ("gated", "fg_only"):
+        raise ValueError(f"Unknown F-PKD denominator mode: {denom_mode}")
     dev = _dev_type(adapted_s[0])
     with torch.amp.autocast(device_type=dev, enabled=False):
         level_losses: List[torch.Tensor] = []
@@ -318,11 +327,16 @@ def compute_fpkd_loss(
                 )
             if sample_weights is not None:
                 w_sp = w_sp * sample_weights.float().view(-1, 1, 1, 1)
+            if denom_mode == "fg_only":
+                fg_sum = w_sp.sum()
             if spatial_gate_maps is not None and lvl_idx < len(spatial_gate_maps):
                 w_sp = w_sp * spatial_gate_maps[lvl_idx].float()
 
             denom = w_sp.sum()
-            if denom < 1e-4:
+            if denom_mode == "fg_only":
+                loss = (dist * w_sp).sum() / fg_sum.clamp(min=eps)
+                level_losses.append(torch.where((fg_sum >= 1e-4) & (denom >= 1e-6), loss, 0.0))
+            elif denom < 1e-4:
                 level_losses.append(torch.zeros((), device=u.device, dtype=torch.float32))
             else:
                 level_losses.append((dist * w_sp).sum() / denom.clamp(min=eps))
@@ -544,6 +558,62 @@ def compute_spatial_illumination_mask(
         authentic = (e_v >= (1.0 - 1e-4)) & (v_win >= (1.0 - 1e-4))
         safe = authentic & (mu_local >= float(mean_thresh)) & (sigma_local >= float(std_thresh))
         return safe.float()
+
+
+@torch.no_grad()
+def compute_quantile_macro_illumination_masks(
+    rgb_img: torch.Tensor,
+    feature_shapes: Sequence[Tuple[int, int]],
+    *,
+    valid_mask: Optional[torch.Tensor] = None,
+    q50_thresh: float = 0.15,
+    macro_std_thresh: float = 0.025,
+) -> List[torch.Tensor]:
+    """Compute median cell brightness and pixel contrast once for the entire pyramid."""
+    x = rgb_img.float()
+    if rgb_img.dtype == torch.uint8:
+        x = x / 255.0
+    else:
+        x = x / torch.where(x.amax() > 1.5, 255.0, 1.0)
+    lum = x.mean(dim=1, keepdim=True)
+    if valid_mask is None:
+        v_px = torch.ones_like(lum)
+    else:
+        v_px = valid_mask.to(lum)
+        if v_px.ndim == 3:
+            v_px = v_px.unsqueeze(1)
+        v_px = (v_px > torch.where(v_px.amax() > 1.5, 127.0, 0.5)).float()
+        if v_px.shape[-2:] != lum.shape[-2:]:
+            v_px = F.interpolate(v_px, size=lum.shape[-2:], mode="nearest")
+
+    grid = (16, 16)
+    e_v = F.adaptive_avg_pool2d(v_px, grid)
+    e_vx = F.adaptive_avg_pool2d(lum * v_px, grid)
+    e_vx2 = F.adaptive_avg_pool2d(lum.square() * v_px, grid)
+    cell_valid = e_v >= 0.50
+    cell_mu = e_vx / e_v.clamp(min=1e-6)
+
+    valid_windows = F.unfold(cell_valid.float(), 5, padding=2).bool()
+    counts = valid_windows.sum(dim=1, keepdim=True)
+    windows = F.unfold(cell_mu, 5, padding=2)
+    # The sentinel exceeds all luminances and stays finite for empty windows.
+    ordered = windows.masked_fill(~valid_windows, 2.0).sort(dim=1).values
+    lower = ordered.gather(1, (counts - 1).clamp(min=0) // 2)
+    upper = ordered.gather(1, counts // 2)
+    q50 = ((lower + upper) * 0.5).view_as(e_v)
+
+    def window_mean(cells: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(cells, 5, stride=1, padding=2, count_include_pad=False)
+
+    mass = window_mean(e_v).clamp(min=1e-6)
+    mean = window_mean(e_vx) / mass
+    sigma = (window_mean(e_vx2) / mass - mean.square()).clamp(min=0).sqrt()
+    safe = cell_valid & (counts.view_as(e_v) >= 3) & (q50 >= q50_thresh) & (sigma >= macro_std_thresh)
+    return [
+        F.interpolate(safe.float(), size=hw, mode="nearest")
+        * (F.adaptive_avg_pool2d(v_px, hw) >= 0.50)
+        for hw in feature_shapes
+    ]
 
 
 def compute_dual_teacher_advantage_gate(
@@ -1155,6 +1225,35 @@ class YOLO26DistillCriterion:
                 + float(cfg.runner_up_weight) * loss_run
             )
 
+    @torch.no_grad()
+    def _cm_anchor_gate(
+        self, branch: str, aux_pred: Dict[str, torch.Tensor], branch_loss: Any,
+        t_assign: Dict[str, torch.Tensor], fg: torch.Tensor, safe: torch.Tensor,
+        anchors: torch.Tensor, strides: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compare both teachers on the IR-assigned object, in anchor-grid coordinates."""
+        cfg = self._kd_cfg
+        if not cfg.use_dual_advantage_gate:
+            return safe * fg
+        with torch.amp.autocast(device_type=_dev_type(safe), enabled=False):
+            b, a = fg.nonzero(as_tuple=True)
+            gate = torch.zeros_like(safe)
+            if a.numel() == 0:
+                return gate
+            labels = t_assign[f"t_{branch}_labels"][b, a].clamp(0, aux_pred["scores"].size(1) - 1)
+            gt = t_assign[f"t_{branch}_gt_px"][b, a] / strides[a].float()
+            ir_boxes = t_assign[f"t_{branch}_boxes"][b, a]
+            aux_dist = aux_pred["boxes"].transpose(1, 2).contiguous().float()
+            aux_boxes = branch_loss.bbox_decode(anchors.float(), aux_dist)
+            p_ir = t_assign[f"t_{branch}_scores"][b, a, labels].float().sigmoid()
+            p_rgb = aux_pred["scores"][b, labels, a].float().sigmoid()
+            q_ir = p_ir * compute_box_iou_variants_fp32(ir_boxes, gt, mode="iou")
+            q_rgb = p_rgb * compute_box_iou_variants_fp32(aux_boxes[b, a], gt, mode="iou")
+            gate[b, a] = compute_dual_teacher_advantage_gate(
+                q_ir, q_rgb, margin=cfg.cm_margin, tau=cfg.cm_tau, image_safe=safe[b, a],
+            )
+            return gate
+
     def _compute_track_b_cm_kd(
         self,
         rgb_img: torch.Tensor,
@@ -1197,27 +1296,55 @@ class YOLO26DistillCriterion:
             if aux_feats is None:
                 aux_feats = aux_o2m["feats"]
 
-            # Spatially-aware illumination safety maps `(B, 1, H_l, W_l)` per FPN scale
-            safe_maps: List[torch.Tensor] = []
-            for f_s, st in zip(s_feats, strides_list):
-                fh, fw = int(f_s.shape[2]), int(f_s.shape[3])
-                if cfg.use_night_circuit_breaker:
-                    sm = compute_spatial_illumination_mask(
-                        rgb_img,
-                        (fh, fw),
-                        stride=float(st),
-                        mean_thresh=cfg.night_mean_thresh,
-                        std_thresh=cfg.night_std_thresh,
-                        valid_mask=rgb_valid_mask,
+            shapes = [f.shape[-2:] for f in s_feats]
+            if not cfg.use_night_circuit_breaker:
+                safe_maps = [zero.new_ones((rgb_img.shape[0], 1, *hw)) for hw in shapes]
+            elif cfg.cm_illum_mode == "quantile_macro":
+                safe_maps = compute_quantile_macro_illumination_masks(
+                    rgb_img, shapes, valid_mask=rgb_valid_mask,
+                    q50_thresh=cfg.night_q50_thresh, macro_std_thresh=cfg.night_macro_std_thresh,
+                )
+            elif cfg.cm_illum_mode == "legacy_spatial":
+                safe_maps = [
+                    compute_spatial_illumination_mask(
+                        rgb_img, hw, stride=st, mean_thresh=cfg.night_mean_thresh,
+                        std_thresh=cfg.night_std_thresh, valid_mask=rgb_valid_mask,
                     )
-                else:
-                    sm = torch.ones((rgb_img.shape[0], 1, fh, fw), device=device, dtype=torch.float32)
-                safe_maps.append(sm)
+                    for hw, st in zip(shapes, strides_list)
+                ]
+            else:
+                raise ValueError(f"Unknown CM illumination mode: {cfg.cm_illum_mode}")
             illum_safe_frac = torch.stack([m.mean() for m in safe_maps]).mean()
+
+        use_feat = cfg.lambda_cm_feat > 0 and self._aux_adapters is not None
+        use_cls = cfg.lambda_cm_cls > 0
+        gate_features = use_feat and cfg.cm_feat_quality_gate and cfg.use_dual_advantage_gate
+        feat_gate_maps = safe_maps
+        if use_cls or gate_features:
+            safe_anchors = torch.cat([sm.flatten(1) for sm in safe_maps], dim=1)
+            if safe_anchors.shape != t_assign["t_o2m_fg"].shape or safe_anchors.size(1) != anchor_points.size(0):
+                raise ValueError("Track B FPN spatial sizes do not match the teacher anchor layout")
+            o2m_fg = t_assign["t_o2m_fg"]
+            if use_cls:
+                # Classification requires a shared positive for the same GT object.
+                o2m_mask = o2m_fg & s_o2m_fg.bool() & (t_assign["t_o2m_gt_idx"] == s_o2m_gt_idx)
+                if not gate_features:
+                    o2m_fg = o2m_mask
+                o2o_mask = t_assign["t_o2o_fg"] & s_o2o_fg.bool() & (t_assign["t_o2o_gt_idx"] == s_o2o_gt_idx)
+            o2m_gate = self._cm_anchor_gate(
+                "o2m", aux_o2m, self._base.one2many, t_assign,
+                o2m_fg, safe_anchors, anchor_points, stride_tensor,
+            )
+            if gate_features:
+                counts = [h * w for h, w in shapes]
+                feat_gate_maps = [
+                    F.max_pool2d(level.view_as(safe), 3, stride=1, padding=1) * safe
+                    for level, safe in zip(o2m_gate.split(counts, dim=1), safe_maps)
+                ]
 
         # 1. Low-frequency structural RGB -> IR feature alignment (reuses shared STAL fg maps!)
         l_cm_feat = zero
-        if float(cfg.lambda_cm_feat) > 0.0 and self._aux_adapters is not None:
+        if use_feat:
             with torch.amp.autocast(device_type=_dev_type(s_feats[0]), enabled=False):
                 aux_adapted = self._aux_adapters(s_feats)
                 l_cm_feat = compute_fpkd_loss(
@@ -1229,104 +1356,46 @@ class YOLO26DistillCriterion:
                     min_radius=cfg.stal_min_radius,
                     bg_weight=cfg.bg_weight,
                     lowpass=cfg.cm_lowpass_feat,
-                    spatial_gate_maps=safe_maps,
+                    spatial_gate_maps=feat_gate_maps,
+                    # The naive control retains illumination-only gates with the same v2 denominator.
+                    denom_mode="fg_only" if cfg.cm_feat_quality_gate else "gated",
                     precomputed_fg_maps=precomputed_fg_maps,
                 )
 
         # 2. Dual-teacher advantage-gated semantic classification calibration (ZERO RGB box regression!)
         l_cm_cls = zero
         gate_active_frac = zero
-        if float(cfg.lambda_cm_cls) > 0.0:
-            with torch.amp.autocast(device_type=_dev_type(rgb_img), enabled=False):
-                safe_anchors = torch.cat([sm.flatten(1) for sm in safe_maps], dim=1)  # (B, total_anchors)
-                anchors_f = anchor_points.float()
-                strides_f = stride_tensor.float()
+        if use_cls:
+            o2o_gate = self._cm_anchor_gate(
+                "o2o", aux_o2o, self._base.one2one, t_assign, o2o_mask,
+                safe_anchors, anchor_points, stride_tensor,
+            )
 
-                def _cm_cls_branch(
-                    s_pred: Dict[str, torch.Tensor],
-                    branch_loss_obj: Any,
-                    t_ir_scores_all: torch.Tensor,
-                    t_ir_boxes_all: torch.Tensor,
-                    t_ir_labels_all: torch.Tensor,
-                    t_ir_gt_px_all: torch.Tensor,
-                    aux_pred: Dict[str, torch.Tensor],
-                    fg_mask: torch.Tensor,
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
-                    if not fg_mask.any():
-                        return zero, zero
-                    b_idx, a_idx = fg_mask.nonzero(as_tuple=True)
-                    n = b_idx.numel()
-                    idx = torch.arange(n, device=device)
-
-                    s_scores = s_pred["scores"].permute(0, 2, 1).contiguous().float()
-                    s_sc_pos = s_scores[b_idx, a_idx]
-
-                    with torch.no_grad():
-                        aux_dist = aux_pred["boxes"].permute(0, 2, 1).contiguous().float()
-                        aux_scores = aux_pred["scores"].permute(0, 2, 1).contiguous().float()
-                        aux_boxes = branch_loss_obj.bbox_decode(anchors_f, aux_dist)
-
-                        aux_sc_pos = aux_scores[b_idx, a_idx]
-                        aux_bx_pos = aux_boxes[b_idx, a_idx]
-                        ir_sc_pos = t_ir_scores_all[b_idx, a_idx]
-                        ir_bx_pos = t_ir_boxes_all[b_idx, a_idx]
-                        gt_lbl_pos = t_ir_labels_all[b_idx, a_idx].clamp(0, s_sc_pos.shape[-1] - 1)
-                        gt_grid = t_ir_gt_px_all[b_idx, a_idx] / strides_f[a_idx]
-                        safe_pos = safe_anchors[b_idx, a_idx]
-
-                        if cfg.use_dual_advantage_gate:
-                            p_ir = ir_sc_pos.sigmoid()[idx, gt_lbl_pos]
-                            iou_ir = compute_box_iou_variants_fp32(ir_bx_pos, gt_grid, mode="iou")
-                            q_ir = p_ir * iou_ir
-
-                            p_rgb = aux_sc_pos.sigmoid()[idx, gt_lbl_pos]
-                            iou_rgb = compute_box_iou_variants_fp32(aux_bx_pos, gt_grid, mode="iou")
-                            q_rgb = p_rgb * iou_rgb
-
-                            g_cm = compute_dual_teacher_advantage_gate(
-                                q_ir,
-                                q_rgb,
-                                margin=cfg.cm_margin,
-                                tau=cfg.cm_tau,
-                                image_safe=safe_pos,
-                            )
-                        else:
-                            g_cm = safe_pos
-
-                        act = (g_cm > 1e-4).float().mean()
-                    g_sum = g_cm.sum()
-                    if g_sum < 1e-4:
-                        return zero, act
-                    loss_c = (
-                        compute_soft_bce_kd(s_sc_pos, aux_sc_pos, tau=cfg.cls_tau) * g_cm
-                    ).sum() / g_sum.clamp(min=1e-6)
-                    return loss_c, act
-
-                # Enforce BOTH shared positive anchor AND identical GT object ID (`t_gt_idx == s_gt_idx`)!
-                o2m_mask = t_assign["t_o2m_fg"] & s_o2m_fg.bool() & (t_assign["t_o2m_gt_idx"] == s_o2m_gt_idx.long())
-                o2o_mask = t_assign["t_o2o_fg"] & s_o2o_fg.bool() & (t_assign["t_o2o_gt_idx"] == s_o2o_gt_idx.long())
-                lc_o2m, act_o2m = _cm_cls_branch(
-                    s_o2m,
-                    self._base.one2many,
-                    t_assign["t_o2m_scores"],
-                    t_assign["t_o2m_boxes"],
-                    t_assign["t_o2m_labels"],
-                    t_assign["t_o2m_gt_px"],
-                    aux_o2m,
-                    o2m_mask,
+            def _cm_cls_branch(
+                s_pred: Dict[str, torch.Tensor],
+                aux_pred: Dict[str, torch.Tensor],
+                fg_mask: torch.Tensor,
+                gate: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
+                g_cm = gate[fg_mask]
+                n = g_cm.numel()
+                if n == 0:
+                    return zero, zero
+                act = (g_cm > 1e-4).float().mean()
+                g_sum = g_cm.sum()
+                if g_sum < 1e-4:
+                    return zero, act
+                denom = float(n) if cfg.cm_cls_fg_norm else g_sum.clamp(min=1e-6)
+                per_anchor = compute_soft_bce_kd(
+                    s_pred["scores"].transpose(1, 2)[fg_mask],
+                    aux_pred["scores"].transpose(1, 2)[fg_mask], tau=cfg.cls_tau,
                 )
-                lc_o2o, act_o2o = _cm_cls_branch(
-                    s_o2o,
-                    self._base.one2one,
-                    t_assign["t_o2o_scores"],
-                    t_assign["t_o2o_boxes"],
-                    t_assign["t_o2o_labels"],
-                    t_assign["t_o2o_gt_px"],
-                    aux_o2o,
-                    o2o_mask,
-                )
-                l_cm_cls = 0.5 * lc_o2m + 1.0 * lc_o2o
-                gate_active_frac = 0.5 * (act_o2m + act_o2o)
+                return (per_anchor * g_cm).sum() / denom, act
+
+            lc_o2m, act_o2m = _cm_cls_branch(s_o2m, aux_o2m, o2m_mask, o2m_gate)
+            lc_o2o, act_o2o = _cm_cls_branch(s_o2o, aux_o2o, o2o_mask, o2o_gate)
+            l_cm_cls = 0.5 * lc_o2m + lc_o2o
+            gate_active_frac = 0.5 * (act_o2m + act_o2o)
 
         return l_cm_feat, l_cm_cls, illum_safe_frac, gate_active_frac
 
@@ -1482,10 +1551,14 @@ class YOLO26DistillCriterion:
                 raise ValueError(f"Unknown feat_kd_mode: {cfg.feat_kd_mode}")
 
         # --- Teacher Assignments (shared by M2, M3 & Track B) ---
+        need_cm_feature_assign = cfg.lambda_cm_feat > 0 and cfg.cm_feat_quality_gate and cfg.use_dual_advantage_gate
         need_t_assign = (
             (cfg.use_m2_cross_o2o and r_m2 > 0.0)
             or cfg.use_m3_qg_head
-            or (self._aux_teacher_model is not None and r_cm > 0.0 and float(cfg.lambda_cm_cls) > 0.0)
+            or (
+                self._aux_teacher_model is not None and r_cm > 0.0
+                and (cfg.lambda_cm_cls > 0 or need_cm_feature_assign)
+            )
         )
         t_assign: Optional[Dict[str, torch.Tensor]] = None
         if need_t_assign:
@@ -1544,7 +1617,7 @@ class YOLO26DistillCriterion:
                 )
             if rgb_valid_mask is not None:
                 rgb_valid_mask = rgb_valid_mask.to(device=device, non_blocking=True)
-            assert t_assign is not None or float(cfg.lambda_cm_cls) <= 0.0
+            assert t_assign is not None or (cfg.lambda_cm_cls <= 0 and not need_cm_feature_assign)
             l_cm_feat, l_cm_cls, illum_safe_frac, cm_gate_frac = self._compute_track_b_cm_kd(
                 rgb_img,
                 rgb_valid_mask,
@@ -1645,6 +1718,8 @@ def attach_yolo26_kd_hook(yolo_model: Any, cfg: YOLO26KDConfig) -> None:
     if not cfg.teacher_weights:
         raise ValueError("YOLO26KDConfig.teacher_weights must be set when KD is enabled.")
 
+    # The training wrapper owns callback configuration. Exported student modules stay separate.
+    yolo_model._yolo26_kd_config = cfg
     state: Dict[str, Any] = {
         "teacher": None,
         "aux_teacher": None,

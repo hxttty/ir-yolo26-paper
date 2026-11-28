@@ -47,6 +47,16 @@ def _config_sha256(cfg: ExperimentConfig) -> str:
     d = cfg.to_dict()
     for transient in ("resume", "save_period", "save_failure_vis", "kd_teacher_weights", "kd_aux_teacher_weights", "kd_aux_rgb_root"):
         d.pop(transient, None)
+    # Old completion flags predate these fields. Only opt-in values affect the digest.
+    for key, legacy_default in (
+        ("kd_cm_illum_mode", "legacy_spatial"),
+        ("kd_night_q50_thresh", 0.15),
+        ("kd_night_macro_std_thresh", 0.025),
+        ("kd_cm_feat_quality_gate", False),
+        ("kd_cm_cls_fg_norm", False),
+    ):
+        if d[key] == legacy_default:
+            del d[key]
     blob = json.dumps(d, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 

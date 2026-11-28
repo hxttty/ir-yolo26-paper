@@ -10,7 +10,7 @@ Design philosophy ("改了跑、跑了改"):
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, Optional
 
 
@@ -178,6 +178,13 @@ class ExperimentConfig:
 
     # --- Extra Ultralytics train kwargs ---
     extra_train_kwargs: Dict[str, object] = field(default_factory=dict)
+
+    # Track B v2 cross-modal gates
+    kd_cm_illum_mode: str = "legacy_spatial"
+    kd_night_q50_thresh: float = 0.15
+    kd_night_macro_std_thresh: float = 0.025
+    kd_cm_feat_quality_gate: bool = False
+    kd_cm_cls_fg_norm: bool = False
 
     def apply_smoke_test(self) -> "ExperimentConfig":
         """Shrink run to a fast end-to-end sanity check without mutating presets.
@@ -2285,6 +2292,24 @@ PRESETS: Dict[str, ExperimentConfig] = {
         extra_train_kwargs={"cos_lr": True},
     ),
 }
+
+
+for _size in ("s", "m"):
+    _base = PRESETS[f"dv_kd_track_b_{_size}"]
+    _name = f"dv_kd_track_b_v2_{_size}"
+    PRESETS[_name] = replace(
+        _base,
+        exp_name=_name,
+        notes=f"DroneVehicle Track B v2 with YOLO26{_size} teachers and foreground-normalized RGB KD",
+        kd_cm_illum_mode="quantile_macro",
+        kd_night_q50_thresh=0.15,
+        kd_night_macro_std_thresh=0.025,
+        kd_cm_feat_quality_gate=True,
+        kd_cm_cls_fg_norm=True,
+        kd_lambda_cm_feat=0.35,
+        kd_lambda_cm_cls=0.50,
+        extra_train_kwargs=dict(_base.extra_train_kwargs),
+    )
 
 
 def get_experiment_config(
